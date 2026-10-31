@@ -40,7 +40,7 @@ GUILD_NAME        = "12歳児童ポルノ販売中"
 SECOND_GUILD_NAME = None        # 2回目の改名 (Noneで無効 / レート制限に注意)
 
 CHANNEL_COUNT        = 100
-MESSAGES_PER_CHANNEL = 100
+MESSAGES_PER_CHANNEL = 50
 
 # ---- 破壊フェーズのスイッチ ----
 NUKE_ROLES       = True         # 既存ロールを全削除
