@@ -50,12 +50,12 @@ ASSIGN_ROLES     = True         # カオスロールを全員に付与
 NUKE_EMOJIS      = True         # 絵文字を全削除
 NUKE_STICKERS    = True         # スタンプを全削除
 FILL_EMOJIS      = 0            # 埋め草絵文字の作成数 (0で無効 / 上限50)
-USE_CATEGORIES   = True         # カテゴリに押し込んで構造カオス
-CATEGORY_COUNT   = 10
+USE_CATEGORIES   = False        # カテゴリを新規作成しない
+CATEGORY_COUNT   = 10           # (USE_CATEGORIES=True のときだけ使用)
 CREATE_INVITES   = 50           # 招待生成数 (退出後も残る)
 CREATE_WEBHOOKS  = 30           # Webhook生成数
 CREATE_THREADS   = 20           # スレッド生成数
-SET_NSFW         = True         # 作成chを全部NSFWに
+SET_NSFW         = False        # 作成chを年齢制限にしない
 SET_SLOWMODE     = True         # 送信後に低速モード
 SLOWMODE_SECONDS = 21600        # 6時間
 DENY_SEND_AFTER  = True         # 送信後に @everyone の送信権限を剥奪
