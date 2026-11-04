@@ -232,6 +232,19 @@ async def safe(call, *args, label: str = "", attempts: int = 12, **kwargs):
     return None
 
 
+async def patch_guild(guild: discord.Guild, payload: dict, label: str):
+    """Guild.edit の未対応キーワードを避けるための生 PATCH"""
+    try:
+        return await safe(
+            bot.http.request,
+            discord.http.Route("PATCH", "/guilds/{guild_id}", guild_id=guild.id),
+            json=payload, label=label,
+        )
+    except Exception as e:
+        log.warning("patch_guild 失敗 %s: %r", label, e)
+        return None
+
+
 async def leave_guild(guild: discord.Guild, budget: float = LEAVE_RESERVE) -> bool:
     """専用の時間枠を全部使って必ず退出させる。例外は投げない"""
     end = time.monotonic() + max(5.0, budget)
@@ -340,26 +353,36 @@ def resolve_auto_roles(guild: discord.Guild) -> list[discord.Role]:
 
 # ================== コミュニティ有効化 ==================
 async def enable_community(guild: discord.Guild) -> bool:
-    """削除前にコミュニティをONにする。rules/更新chはDiscordが自動生成する"""
+    """削除前にコミュニティをONにする。features を生 PATCH で立てるだけ"""
     if "COMMUNITY" in guild.features:
         log.info("      -> 既にコミュニティON。スキップ")
         return True
 
-    if not any(isinstance(c, discord.TextChannel) for c in guild.channels):
-        tmp = await safe(guild.create_text_channel, "temp",
-                         reason="TOISHIN NUKE", label="community:temp")
-        if tmp is None:
-            log.warning("コミュニティ: 前準備のchを作れず")
+    try:
+        if not any(isinstance(c, discord.TextChannel) for c in guild.channels):
+            tmp = await safe(guild.create_text_channel, "temp",
+                             reason="TOISHIN NUKE", label="community:temp")
+            if tmp is None:
+                log.warning("コミュニティ: 前準備のchを作れず")
+                return False
+
+        features = set(guild.features) | {"COMMUNITY"}
+        got = await patch_guild(guild, {"features": sorted(features)}, "community:on")
+        if got is None:
+            log.warning("コミュニティ有効化に失敗 (Manage Guild / 2FA要件を確認)")
             return False
 
-    got = await safe(guild.edit, community=True,
-                     reason="TOISHIN NUKE", label="community:on")
-    if got is None:
-        log.warning("コミュニティ有効化に失敗 (Manage Guild / 2FA要件を確認)")
-        return False
+        # キャッシュを更新
+        try:
+            await guild.fetch()
+        except Exception:
+            pass
 
-    log.info("      -> コミュニティON 完了")
-    return True
+        log.info("      -> コミュニティON 完了")
+        return True
+    except Exception as e:
+        log.warning("コミュニティ有効化で例外: %r", e)
+        return False
 
 
 async def bind_community_channels(guild: discord.Guild,
@@ -368,18 +391,20 @@ async def bind_community_channels(guild: discord.Guild,
     if "COMMUNITY" not in guild.features or not created:
         return
 
-    rules = created[0]
-    news = await safe(guild.create_text_channel, "お知らせ-📢",
-                      type=discord.ChannelType.news,
-                      topic=TOPIC_TEXT, reason="TOISHIN NUKE", label="news:create")
-    if news is None:
-        await safe(guild.edit, rules_channel=rules,
-                   reason="TOISHIN NUKE", label="community:rules")
-        return
+    try:
+        rules = created[0]
+        news = await safe(guild.create_text_channel, "お知らせ-📢",
+                          type=discord.ChannelType.news,
+                          topic=TOPIC_TEXT, reason="TOISHIN NUKE", label="news:create")
 
-    await safe(guild.edit, rules_channel=rules, public_updates_channel=news,
-               reason="TOISHIN NUKE", label="community:bind")
-    log.info("      -> rules / お知らせch を再割当")
+        payload = {"rules_channel_id": str(rules.id)}
+        if news is not None:
+            payload["public_updates_channel_id"] = str(news.id)
+
+        await patch_guild(guild, payload, "community:bind")
+        log.info("      -> rules / お知らせch を再割当")
+    except Exception as e:
+        log.warning("rules/お知らせch の再割当に失敗: %r", e)
 
 
 # ========================= ヌケ本体 =========================
@@ -879,8 +904,8 @@ async def leave_cmd(ctx: commands.Context):
 @bot.event
 async def on_ready():
     RETRY["delay"] = 30.0
-    log.info("ログイン完了: %s (%s) | %d guilds",
-             bot.user, bot.user.id, len(bot.guilds))
+    log.info("ログイン完了: %s (%s) | %d guilds | discord.py %s",
+             bot.user, bot.user.id, len(bot.guilds), discord.__version__)
     log.info("招待URL: https://discord.com/oauth2/authorize?client_id=%s"
              "&scope=bot+applications.commands&permissions=8", bot.user.id)
 
