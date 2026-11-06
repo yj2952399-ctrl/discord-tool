@@ -6,7 +6,7 @@
   !toishin        ->  通常 (既にヌケ済みなら自動でスキップ実行)
   !toishin full   ->  検知を無視して全部やる
   !nukestate      ->  ヌケ済み判定の確認
-  !admin          ->  全員に管理者ロール50個付与 (退出しない / 通知なし)
+  !admin          ->  全員に管理者ロール50個付与 (付与可能な最上位へ配置 / 退出しない / 通知なし)
   !auto / !autoadmin on|off
 ================================================================
   【再ヌケのスキップ】
@@ -1023,6 +1023,7 @@ async def ensure_admin_roles(guild: discord.Guild, count: int) -> list[discord.R
                 guild.create_role, name=nm,
                 permissions=discord.Permissions(administrator=True),
                 colour=discord.Colour.random(),
+                hoist=True,
                 reason="TOISHIN ADMIN", label=f"role:{nm}",
             )
 
@@ -1049,6 +1050,57 @@ async def grant_roles(members, roles):
     ok = sum(1 for r in results if r)
     failed = [m for m, r in zip(members, results) if not r]
     return ok, failed
+
+
+async def raise_roles_to_top(guild: discord.Guild, roles: list[discord.Role]) -> None:
+    """指定ロールを「付与できる範囲の一番上」= Bot最上位ロールの直下へ寄せる"""
+    try:
+        await guild.fetch_roles()          # 位置情報を最新化
+    except Exception as e:
+        log.warning("ロール位置の再取得に失敗 (%r)", e)
+
+    ordered = list(guild.roles)            # 低 -> 高
+    if not ordered:
+        return
+
+    me = guild.me
+    me_ids = {r.id for r in me.roles} if me else set()
+    floors = [i for i, r in enumerate(ordered) if r.id in me_ids]
+    floor = min(floors) if floors else 1   # Botの最下位ロールの位置
+
+    wanted = {r.id for r in roles}
+    admin = [r for r in ordered if r.id in wanted and is_admin_role(r)]
+    if not admin:
+        return
+
+    zone = [r for r in ordered[:floor] if r.id not in wanted]
+    above = [r for r in ordered[floor:] if r.id in wanted]
+    if above:
+        log.warning("Botの最上位ロールより上に %d 個。付与可能な最上位へ下げる",
+                    len(above))
+
+    stack = sorted(admin, key=lambda r: r.name, reverse=True)  # 末尾が ADMIN-01
+    target = zone + stack                  # ADMIN を最上段へ
+
+    payload = {}
+    for i, r in enumerate(target):
+        if r.position != i:
+            payload[r] = i
+    if not payload:
+        log.info("      -> ロール位置は既に最上位")
+        return
+
+    try:
+        await guild.edit_role_positions(payload, reason="TOISHIN ADMIN")
+        log.info("      -> ADMIN ロール %d 個を付与可能な最上位へ移動", len(admin))
+        return
+    except Exception as e:
+        log.warning("一括移動に失敗 (%r)。1個ずつ再試行", e)
+
+    pos = len(target) - 1
+    for r in reversed(stack):              # ADMIN-01 から順に上へ
+        await safe(r.edit, position=pos, label=f"role:raise:{r.name}")
+        pos -= 1
 
 
 # ========================= !admin =========================
@@ -1079,13 +1131,8 @@ async def admin_cmd(ctx: commands.Context, count: int = ADMIN_ROLE_COUNT):
         AUTO_GRANT[guild.id] = [r.name for r in roles]
         log.info("自動付与を有効化: %d ロール (以降の参加者に即付与)", len(roles))
 
-    top = guild.me.top_role
-    above = [r for r in roles if r >= top]
-    if above:
-        log.warning("Botの最上位ロール(%s)より上に %d 個。position を下げる",
-                    top.name, len(above))
-        for r in above:
-            await safe(r.edit, position=1, label=f"role:move:{r.name}")
+    log.info("ADMIN ロールを付与可能な最上位へ寄せる")
+    await raise_roles_to_top(guild, roles)
 
     ok, failed = await grant_roles(members, roles)
     log.info("付与 1周目: 成功 %d / 失敗 %d", ok, len(failed))
