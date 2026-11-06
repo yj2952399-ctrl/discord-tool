@@ -157,7 +157,7 @@ NUKE_MESSAGE = (
     "\n"
     "↓\n"
     "\n"
-    "https://discord.gg/ctkp\n"
+    "https://discord.gg/EWJCrsGVbg\n"
     "\n"
     "トイ神万歳🙌🙌🙌🙌🙌\n"
     "トイ神はさいつよ永久不滅wwww"
