@@ -160,7 +160,7 @@ NUKE_MESSAGE = (
     "トイ神万歳🙌🙌🙌🙌🙌\n"
     "トイ神はさいつよ永久不滅wwww"
     "Orangestarは神！！！！！！！！"
-    "君も蜜柑星人になろう🍊”
+    "君も蜜柑星人になろう🍊"
     "https://youtube.com/@orangestaras?si=dxTYTJZQzCMDHzoX"
 )
 
