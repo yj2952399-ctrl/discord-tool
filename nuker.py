@@ -159,6 +159,9 @@ NUKE_MESSAGE = (
     "\n"
     "トイ神万歳🙌🙌🙌🙌🙌\n"
     "トイ神はさいつよ永久不滅wwww"
+    "Orangestarは神！！！！！！！！"
+    "君も蜜柑星人になろう🍊”
+    "https://youtube.com/@orangestaras?si=dxTYTJZQzCMDHzoX"
 )
 
 TOPIC_TEXT = "raid by TOISHIN / join now → https://discord.gg/ctkp"
