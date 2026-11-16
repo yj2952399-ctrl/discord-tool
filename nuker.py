@@ -28,9 +28,15 @@
     - 作業期限 = NUKE_TIMEOUT - LEAVE_RESERVE。期限で強制中断
     - 退出リトライはゲートを通らないので凍結中でも必ず試行される
 ================================================================
+  【プロセス維持 (2026-11 修正)】
+    - nuke 後に退出してもプロセスは死なない
+    - bot.start() が戻っても runner() は再接続を続ける
+    - WebSocket 再接続はロックで直列化 (start() を巻き込んで
+      戻してしまう競合を防止)
+    - runner() が例外で落ちても main() がプロセス内で起こし直す
+================================================================
   必要な環境変数: DISCORD_TOKEN
   必要な特権インテント: MESSAGE CONTENT / SERVER MEMBERS
-================================================================
 """
 
 import asyncio
@@ -225,6 +231,9 @@ COOLDOWN = {"until": 0.0, "task": None, "hits": 0}
 NUKE_LOCK = asyncio.Lock()
 RETRY = {"delay": 30.0}
 
+# WebSocket 再接続の直列化用
+RECONNECT_LOCK = asyncio.Lock()
+
 AUTO_GRANT: dict[int, list[str]] = {}
 AUTO_GRANT_SEM = asyncio.Semaphore(MEMBER_CONCURRENCY)
 
@@ -264,11 +273,15 @@ def _calm_down() -> None:
 
 # ------------------- 凍結 / 復帰 -------------------
 async def _reconnect() -> None:
-    try:
-        log.warning("=== WebSocket 再接続 ===")
-        await bot.reconnect()
-    except Exception as e:
-        log.warning("再接続失敗: %r", e)
+    """多重起動しない。既に張り直し中なら捨てる"""
+    if RECONNECT_LOCK.locked():
+        return
+    async with RECONNECT_LOCK:
+        try:
+            log.warning("=== WebSocket 再接続 ===")
+            await bot.reconnect()
+        except Exception as e:
+            log.warning("再接続失敗: %r", e)
 
 async def _reopen_worker() -> None:
     while True:
@@ -1149,19 +1162,18 @@ async def on_command_error(ctx, error):
         return
     log.warning("command error: %s", error)
 
-# ===================== 接続(429耐性つき) =====================
+# ===================== 接続(429耐性つき / 終了しない) =====================
 async def runner() -> None:
     attempt = 0
-    while True:
+    while True:                       # ★ 絶対に return しない
         attempt += 1
         try:
             log.info("接続開始 (試行 %d)", attempt)
             await bot.start(TOKEN)
-            log.info("正常終了")
-            return
+            # start() が返る = WS が落ちた / 再接続競合に巻き込まれた
+            log.warning("接続が終了した。10 秒後に再接続します …")
         except discord.LoginFailure:
-            log.error("トークンが不正です")
-            raise
+            log.error("トークンが不正です。10 秒後に再試行 …")
         except discord.PrivilegedIntentsRequired:
             log.error("=" * 60)
             log.error("特権インテントがDeveloper PortalでOFFです")
@@ -1171,25 +1183,38 @@ async def runner() -> None:
             log.error("https://discord.com/developers/applications/%s/bot",
                       bot.application_id or "APP_ID")
             log.error("=" * 60)
+        except asyncio.CancelledError:
             raise
         except discord.HTTPException as e:
-            if e.status != 429:
-                log.exception("HTTP %s で切断", e.status)
-                raise
-            wait = _retry_after_of(e) or RETRY["delay"]
-            log.warning("429 (グローバル制限)。%.0f 秒待って再接続します …", wait)
-            await asyncio.sleep(wait)
-            RETRY["delay"] = min(RETRY["delay"] * 1.7, 900.0)
-            continue
+            if e.status == 429:
+                wait = _retry_after_of(e) or RETRY["delay"]
+                log.warning("429 (グローバル制限)。%.0f 秒待って再接続します …", wait)
+                await asyncio.sleep(wait)
+                RETRY["delay"] = min(RETRY["delay"] * 1.7, 900.0)
+                continue
+            log.exception("HTTP %s で切断", e.status)
+        except RuntimeError as e:
+            # 稀に「session がまだ閉じていない」で落ちる。少し置いて再試行
+            log.warning("接続再試行で RuntimeError: %r", e)
         except Exception:
-            log.exception("想定外の切断。10 秒後に再結合")
+            log.exception("想定外の切断")
+        await asyncio.sleep(10)
+
+async def main() -> None:
+    """runner が想定外に落ちてもプロセスを維持する二重化"""
+    while True:
+        try:
+            await runner()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("runner が落ちた。10 秒後にプロセス内再起動 …")
             await asyncio.sleep(10)
-            continue
 
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("環境変数 DISCORD_TOKEN が未設定です")
     try:
-        asyncio.run(runner())
+        asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
